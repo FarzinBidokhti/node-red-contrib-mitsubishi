@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Qq225083/node-red-contrib-mitsubishi"
+    "url": "git+https://github.com/Qq225083/node-red-contrib-mitsubishi.git"
   },
   "bugs": {
     "url": "https://github.com/Qq225083/node-red-contrib-mitsubishi/issues"
