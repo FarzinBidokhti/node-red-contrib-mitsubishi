@@ -65,6 +65,8 @@ module.exports = function (RED) {
     if (entry && entry.socket && !entry.socket.destroyed && !entry.inUse && !entry.connecting) {
       entry.inUse = true;
       entry.lastUsed = Date.now();
+      entry.users = entry.users || {};
+      entry.users[node.id] = true;
       entry.socket.setTimeout(plc.timeout);
       callback(null, entry.socket);
       return;
@@ -134,6 +136,8 @@ module.exports = function (RED) {
       entry.lastUsed = Date.now();
       entry.backoffMs = 0;
       entry.lastErrorTime = 0;
+      entry.users = entry.users || {};
+      entry.users[node.id] = true;
 
       // 空闲断连：PLC/交换机干净关闭时立即清理
       client.once('end', function () { destroyConnection(key); });
@@ -194,6 +198,11 @@ module.exports = function (RED) {
 
     node.plcConfig = RED.nodes.getNode(config.plc);
     if (!node.plcConfig) {
+      _activeNodeCount--;
+      if (_activeNodeCount <= 0 && _cleanTimer) {
+        clearInterval(_cleanTimer);
+        _cleanTimer = null;
+      }
       node.error('未关联 PLC 配置节点');
       return;
     }
@@ -241,6 +250,7 @@ module.exports = function (RED) {
         return ((hash >>> 0) % 9000) + 1000;
       }
       var deviceId = resolveDeviceId(incoming, plc);
+      var deviceName = incoming.deviceName || plc.name || ('PLC-' + deviceId);
 
       var _sent = false;
       function safeSend(m) {
@@ -314,7 +324,7 @@ module.exports = function (RED) {
           var raw = mc.BIT_DEVICES[t.regType] ? (Math.random() > 0.5 ? 1 : 0) : Math.floor(Math.random() * 1000);
           simOut[t.id] = { rawValue: raw, engValue: mc.applyTransform(raw, t), quality: 0, ts: new Date().toISOString(), regType: t.regType };
         });
-        msg.payload = { success: true, deviceId: deviceId, data: simOut, error: null, driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
+        msg.payload = { success: true, deviceId: deviceId, deviceName: deviceName, data: simOut, error: null, driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
         node.status({ fill: 'green', shape: 'dot', text: 'SIM ' + validTags.length + ' tags' });
         safeSend(msg);
         return;
@@ -360,7 +370,7 @@ module.exports = function (RED) {
 
       if (groups.length === 0) {
         node.status({ fill: 'red', shape: 'ring', text: 'no groups' });
-        msg.payload = { success: false, deviceId: deviceId, data: {}, error: 'No valid register groups', driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
+        msg.payload = { success: false, deviceId: deviceId, deviceName: deviceName, data: {}, error: 'No valid register groups', driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
         safeSend(msg);
         return;
       }
@@ -369,7 +379,7 @@ module.exports = function (RED) {
       var poolEntry = CONN_POOL[connKey];
       if (poolEntry && poolEntry.inUse && poolEntry.queue && poolEntry.queue.length > 20) {
         node.status({ fill: 'yellow', shape: 'dot', text: 'throttled' });
-        msg.payload = { success: false, deviceId: deviceId, data: {}, error: 'Throttled: queue > 20', driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
+        msg.payload = { success: false, deviceId: deviceId, deviceName: deviceName, data: {}, error: 'Throttled: queue > 20', driverType: 'driver-mc-protocol', plcIp: plc.host, plcPort: plc.port, roundTimeMs: Date.now() - roundStart };
         safeSend(msg);
         return;
       }
@@ -386,6 +396,7 @@ module.exports = function (RED) {
           msg.payload = {
             success: false,
             deviceId: deviceId,
+            deviceName: deviceName,
             data: {},
             error: '[CONNECT] ' + err.message,
             driverType: 'driver-mc-protocol',
@@ -442,6 +453,7 @@ module.exports = function (RED) {
             msg.payload = {
               success: !hasFailed,
               deviceId: deviceId,
+              deviceName: deviceName,
               data: output,
               error: hasFailed ? firstError : null,
               driverType: 'driver-mc-protocol',
@@ -528,7 +540,14 @@ module.exports = function (RED) {
 
             var buf = Buffer.alloc(0);
             var resolved = false;
-            var _tmoHandler, _errHandler, _dataHandler;
+            var _tmoHandler = null, _errHandler = null, _dataHandler = null;
+
+            function cleanupListeners(sock) {
+              if (!sock) return;
+              sock.removeListener('data', _dataHandler);
+              sock.removeListener('timeout', _tmoHandler);
+              sock.removeListener('error', _errHandler);
+            }
 
             mcSocket.setTimeout(timeout);
 
@@ -540,6 +559,7 @@ module.exports = function (RED) {
             } catch (e) {
               node.warn('[MC] write error: ' + e.message);
               resolved = true;
+              cleanupListeners(mcSocket);
               destroyConnection(connKey);
               getConnection(node, plc, function (e3, newSock2) {
                 if (e3) {
@@ -553,124 +573,120 @@ module.exports = function (RED) {
               return;
             }
 
-            _dataHandler = function (chunk) {
-              try {
-                if (buf.length + chunk.length > 65536) {
-                  resolved = true;
-                  mcSocket.removeListener('data', _dataHandler);
-                  if (_tmoHandler) mcSocket.removeListener('timeout', _tmoHandler);
-                  if (_errHandler) mcSocket.removeListener('error', _errHandler);
-                  node.warn('[MC] Buffer overflow ' + (buf.length + chunk.length) + ' bytes, discarding');
-                  setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                  return;
-                }
-                buf = Buffer.concat([buf, chunk]);
-                var hdrLen = (frameType === '4E') ? 13 : 11;
-                if (!resolved && buf.length >= hdrLen) {
-                  var dataLen = buf.readUInt16LE(7) - ((frameType === '4E') ? 4 : 2);
-                  if (dataLen < 0 || dataLen > 2000) {
+            _dataHandler = function (sock) {
+              return function (chunk) {
+                try {
+                  if (buf.length + chunk.length > 65536) {
                     resolved = true;
-                    mcSocket.removeListener('data', _dataHandler);
-                    if (_tmoHandler) mcSocket.removeListener('timeout', _tmoHandler);
-                    if (_errHandler) mcSocket.removeListener('error', _errHandler);
+                    cleanupListeners(sock);
+                    node.warn('[MC] Buffer overflow ' + (buf.length + chunk.length) + ' bytes, discarding');
                     setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
                     return;
                   }
-                  if (buf.length >= hdrLen + dataLen) {
-                    resolved = true;
-                    mcSocket.removeListener('data', _dataHandler);
-                    if (_tmoHandler) mcSocket.removeListener('timeout', _tmoHandler);
-                    if (_errHandler) mcSocket.removeListener('error', _errHandler);
-                    var raw = mc.parseMCResponse(buf, startA, grp.regType, frameType, sentSN);
+                  buf = Buffer.concat([buf, chunk]);
+                  var hdrLen = (frameType === '4E') ? 13 : 11;
+                  if (!resolved && buf.length >= hdrLen) {
+                    var dataLen = buf.readUInt16LE(7) - ((frameType === '4E') ? 4 : 2);
+                    if (dataLen < 0 || dataLen > 2000) {
+                      resolved = true;
+                      cleanupListeners(sock);
+                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                      return;
+                    }
+                    if (buf.length >= hdrLen + dataLen) {
+                      resolved = true;
+                      cleanupListeners(sock);
+                      var raw = mc.parseMCResponse(buf, startA, grp.regType, frameType, sentSN);
 
-                    if (raw && raw.mcError) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
-                      setTimeout(function () { processGroup(gi + 1); }, 0);
-                    } else if (raw && !raw.err) {
-                      var groupTs = new Date().toISOString();
-                      grp.tags.forEach(function (t) {
-                        var key = grp.regType + t.addr;
-                        var originRv = raw[key];
-                        var cv = originRv;
-                        var q = 0;
-                        if (originRv === undefined || originRv === null) { q = 2; originRv = null; cv = null; }
-                        else if (!isBit) {
-                          var dtTag = t.dataType || 'INT16';
-                          if (dtTag === 'UINT16') { if (cv < 0) cv += 65536; }
-                          else if (mc.is32BitType(dtTag)) {
-                            var adj = raw[grp.regType + (t.addr + 1)];
-                            if (adj === undefined || adj === null) { q = 2; originRv = null; cv = null; }
-                            else {
-                              var lo = originRv & 0xFFFF;
-                              var hi = adj & 0xFFFF;
-                              var combined = (hi << 16) | lo;
-                              if (dtTag === 'INT32') cv = (combined > 0x7FFFFFFF) ? combined - 0x100000000 : combined;
-                              else if (dtTag === 'UINT32') cv = combined >>> 0;
-                              else if (dtTag === 'FLOAT32') {
-                                var b32 = Buffer.alloc(4);
-                                b32.writeInt16LE(lo, 0); b32.writeInt16LE(hi, 2);
-                                cv = parseFloat(b32.readFloatLE(0).toFixed(4));
+                      if (raw && raw.mcError) {
+                        hasFailed = true;
+                        if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
+                        setTimeout(function () { processGroup(gi + 1); }, 0);
+                      } else if (raw && !raw.err) {
+                        var groupTs = new Date().toISOString();
+                        grp.tags.forEach(function (t) {
+                          var key = grp.regType + t.addr;
+                          var originRv = raw[key];
+                          var cv = originRv;
+                          var q = 0;
+                          if (originRv === undefined || originRv === null) { q = 2; originRv = null; cv = null; }
+                          else if (!isBit) {
+                            var dtTag = t.dataType || 'INT16';
+                            if (dtTag === 'UINT16') { if (cv < 0) cv += 65536; }
+                            else if (mc.is32BitType(dtTag)) {
+                              var adj = raw[grp.regType + (t.addr + 1)];
+                              if (adj === undefined || adj === null) { q = 2; originRv = null; cv = null; }
+                              else {
+                                var lo = originRv & 0xFFFF;
+                                var hi = adj & 0xFFFF;
+                                var combined = (hi << 16) | lo;
+                                if (dtTag === 'INT32') cv = (combined > 0x7FFFFFFF) ? combined - 0x100000000 : combined;
+                                else if (dtTag === 'UINT32') cv = combined >>> 0;
+                                else if (dtTag === 'FLOAT32') {
+                                  var b32 = Buffer.alloc(4);
+                                  b32.writeInt16LE(lo, 0); b32.writeInt16LE(hi, 2);
+                                  cv = parseFloat(b32.readFloatLE(0).toFixed(4));
+                                }
                               }
                             }
                           }
-                        }
-                        allRaw[t.id] = { rawValue: originRv, convertedValue: cv, quality: q, ts: groupTs };
-                      });
-                      setTimeout(function () { processGroup(gi + 1); }, 0);
-                    } else {
-                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                          allRaw[t.id] = { rawValue: originRv, convertedValue: cv, quality: q, ts: groupTs };
+                        });
+                        setTimeout(function () { processGroup(gi + 1); }, 0);
+                      } else {
+                        setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                      }
                     }
                   }
+                } catch (e) {
+                  node.warn('[MC] data handler error: ' + e.message);
+                  cleanupListeners(sock);
+                  resolved = true;
+                  hasFailed = true;
+                  if (!firstError) firstError = '[DATA] ' + e.message;
+                  setTimeout(function () { processGroup(gi + 1); }, 0);
                 }
-              } catch (e) {
-                node.warn('[MC] data handler error: ' + e.message);
-                mcSocket.removeListener('data', _dataHandler);
-                if (_tmoHandler) mcSocket.removeListener('timeout', _tmoHandler);
-                if (_errHandler) mcSocket.removeListener('error', _errHandler);
-                resolved = true;
-                hasFailed = true;
-                if (!firstError) firstError = '[DATA] ' + e.message;
-                setTimeout(function () { processGroup(gi + 1); }, 0);
-              }
-            };
+              };
+            }(mcSocket);
 
             mcSocket.on('data', _dataHandler);
 
-            _tmoHandler = function () {
-              if (resolved) return;
-              resolved = true;
-              mcSocket.removeListener('data', _dataHandler);
-              if (_errHandler) mcSocket.removeListener('error', _errHandler);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e4, newSock3) {
-                if (e4) {
-                  releaseConnection(connKey);
-                  finishWithError();
-                  return;
-                }
-                mcSocket = newSock3;
-                setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-              });
-            };
+            _tmoHandler = function (sock) {
+              return function () {
+                if (resolved) return;
+                resolved = true;
+                cleanupListeners(sock);
+                destroyConnection(connKey);
+                getConnection(node, plc, function (e4, newSock3) {
+                  if (e4) {
+                    releaseConnection(connKey);
+                    finishWithError();
+                    return;
+                  }
+                  mcSocket = newSock3;
+                  setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                });
+              };
+            }(mcSocket);
             mcSocket.once('timeout', _tmoHandler);
 
-            _errHandler = function () {
-              if (resolved) return;
-              resolved = true;
-              mcSocket.removeListener('data', _dataHandler);
-              if (_tmoHandler) mcSocket.removeListener('timeout', _tmoHandler);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e5, newSock4) {
-                if (e5) {
-                  releaseConnection(connKey);
-                  finishWithError();
-                  return;
-                }
-                mcSocket = newSock4;
-                setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-              });
-            };
+            _errHandler = function (sock) {
+              return function () {
+                if (resolved) return;
+                resolved = true;
+                cleanupListeners(sock);
+                destroyConnection(connKey);
+                getConnection(node, plc, function (e5, newSock4) {
+                  if (e5) {
+                    releaseConnection(connKey);
+                    finishWithError();
+                    return;
+                  }
+                  mcSocket = newSock4;
+                  setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                });
+              };
+            }(mcSocket);
             mcSocket.once('error', _errHandler);
           }
           attemptGroup(0);
@@ -681,6 +697,7 @@ module.exports = function (RED) {
           msg.payload = {
             success: false,
             deviceId: deviceId,
+            deviceName: deviceName,
             data: {},
             error: firstError || 'MC connection lost',
             driverType: 'driver-mc-protocol',
@@ -701,15 +718,29 @@ module.exports = function (RED) {
         clearInterval(_cleanTimer);
         _cleanTimer = null;
       }
+      // 🔧 v1.4.1: 引用计数 — 仅当没有其他节点使用该连接时才销毁
       var conns = node._usedConns || {};
       var keys = Object.keys(conns);
       for (var ci = 0; ci < keys.length; ci++) {
-        destroyConnection(keys[ci]);
+        var entry = CONN_POOL[keys[ci]];
+        if (entry && entry.users) {
+          delete entry.users[node.id];
+          if (Object.keys(entry.users).length === 0) {
+            destroyConnection(keys[ci]);
+          }
+        }
       }
       try {
         var p2 = node.plcConfig;
         if (p2 && p2.host) {
-          destroyConnection(poolKey({ host: p2.host, port: p2.port, frame: p2.frame || '3E', networkNo: p2.networkNo || 0, stationNo: p2.stationNo || 0 }));
+          var cfgKey = poolKey({ host: p2.host, port: p2.port, frame: p2.frame || '3E', networkNo: p2.networkNo || 0, stationNo: p2.stationNo || 0 });
+          var cfgEntry = CONN_POOL[cfgKey];
+          if (cfgEntry && cfgEntry.users) {
+            delete cfgEntry.users[node.id];
+            if (Object.keys(cfgEntry.users).length === 0) {
+              destroyConnection(cfgKey);
+            }
+          }
         }
       } catch (e) {}
       node._usedConns = {};

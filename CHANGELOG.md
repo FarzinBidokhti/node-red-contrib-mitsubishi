@@ -1,3 +1,14 @@
+## v1.4.2 (2026-07-18)
+- CHORE: 发布 v1.4.2
+
+## v1.4.1 (2026-07-18)
+- FIX: 输出补全 `deviceName` — 模拟/成功/失败/节流/无组/连接丢失路径全部携带，兼容下游 `sf-data-processor`
+- FIX: 连接池引用计数 — `CONN_POOL[key].users[nodeId]` 跟踪节点使用关系，单个节点 close 不再误杀其他节点共享的连接
+- FIX: `_activeNodeCount` 泄漏 — PLC 配置未关联时提前 return 前正确递减，清理定时器可正常停止
+- FIX: socket 闭包捕获 — `attemptGroup` 内 timeout/error/data 处理器通过 IIFE 绑定当前 socket 实例，重连后避免误操作新 socket
+- FIX: 统一监听器清理 — `cleanupListeners(sock)` 替代多处重复 removeListener
+- TEST: 新增 `deviceName` 传入与 fallback 到 PLC 配置名的测试
+
 ## v1.4.0 (2026-07-18)
 - FIX: INT32/UINT32 高低字顺序修正（D0 为低字，D1 为高字）
 - FIX: X/Y 位元件地址按三菱八进制解析与显示
