@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/npm/l/node-red-contrib-mitsubishi.svg)](LICENSE)
 [![Node-RED](https://img.shields.io/badge/Node--RED-%E2%89%A53.0.0-red.svg)](https://nodered.org)
 
-三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读 N 个点位，零外部依赖，纯 TCP 实现。**
+三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读 N 个点位，零外部依赖，纯 TCP 长连接池实现。**
 
 ---
 
@@ -33,16 +33,22 @@
 ## 特性
 
 - **独立可用** — 纯 Node.js `net` + `Buffer`，不依赖任何第三方库或后端服务
+- **长连接池** 🆕 — TCP 连接持久复用，省端口 + 省握手，跨轮采集无需重复建连
+- **请求队列串行化** 🆕 — 多节点共享同一 PLC 时自动排队，防止读写交错
+- **TCP Keepalive** 🆕 — 30 秒探测保活，防止空闲连接被交换机/防火墙断开
+- **断线自动重建** 🆕 — 连接断开或超时自动检测并重建，对上层透明
+- **deviceId 归一化** 🆕 — 输出始终为数字，兼容下游 `edge_commStatus` 索引
 - **表格编辑器** — 一个节点配置 N 个点位，自动按寄存器类型和地址聚类，合并为批量读取
 - **6 种数据类型** — INT16 / UINT16 / INT32 / UINT32 / FLOAT32 / BOOL
 - **8 种软元件** — D / W / R / X / Y / M / L / B，位元件（X/Y/M/L/B）自动逐位拆包
 - **斜率偏移变换** — `engValue = rawValue × slope + offset`，节点直接输出工程值
+- **动态 IP 覆盖** — `msg.payload.plcIp` 可覆盖 config 固定 IP，一个节点采多台 PLC
 - **4E serialNo 完整支持** — 每帧自增，响应校验，防止串包
 - **批量保护** — 单次读取字数超 960 自动拆包，防 PLC 报 `0xC059`
 - **错误诊断** — 19 个 MC 错误码映射为中文/英文可读信息
 - **模拟模式** — `RED.settings.mcSimulationMode = true` 不连 PLC 即可测试
 - **零依赖** — 仅使用 Node.js 内置 `net` + `Buffer`
-- **15+ 运行时 BUG 已修复** — 锁重入、异步异常、serialNo 首帧跳号、脏帧拦截、批量超限等
+- **防重入保护** — `safeSend` 确保每次触发只输出一条消息
 
 ---
 
@@ -53,7 +59,7 @@ cd ~/.node-red
 npm install node-red-contrib-mitsubishi
 ```
 
-重启 Node-RED，左侧节点栏出现 **"三菱 PLC"** 分类，包含两个节点：
+重启 Node-RED，左侧节点栏 **edgelink** 分类下出现 `MC 读取` 节点。配置节点在 config 侧边栏：
 
 | 节点 | 类型 | 说明 |
 |------|------|------|
@@ -196,20 +202,20 @@ msg.payload = {
 ## 架构
 
 ```
-┌──────────┐     ┌─────────────────────────────┐     ┌──────────┐
-│ inject / │     │     mitsubishi-read          │     │ 三菱 PLC │
-│ 动态tags │────→│                              │────→│          │
-└──────────┘     │  1. 校验 + 清洗点位          │     │ Q / L /  │
-                 │  2. 去重 + 聚类分组          │     │ iQ-R /   │
-                 │  3. 逐组 3E/4E 帧请求        │     │ FX5U     │
-                 │  4. 解码 + 斜率变换          │     └──────────┘
-                 │  5. 输出 {raw,eng,quality}   │
-                 └─────────────────────────────┘
+┌──────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
+│ inject / │     │     mitsubishi-read v1.2.2            │     │ 三菱 PLC │
+│ 动态tags │────→│                                       │────→│          │
+└──────────┘     │  1. 校验 + 清洗点位                   │     │ Q / L /  │
+                 │  2. 去重 + 聚类分组                   │     │ iQ-R /   │
+                 │  3. 长连接池 ──→ 逐组 3E/4E 帧请求   │     │ FX5U     │
+                 │  4. 解码 + 斜率变换                   │     └──────────┘
+                 │  5. 输出 {raw,eng,quality,ts}         │
+                 └──────────────────────────────────────┘
 
- 帧构造: build3EFrame / build4EFrame
- 响应解析: parseMCResponse (subheader + endCode + serialNo + dataLen 校验)
- 错误分类: 19 个 MC 错误码 + 网络错误 + 脏帧拦截
- 锁机制: 按 host:port 维度全局锁，串行采集，60s 过期自释放
+ 连接池: CONN_POOL["host:port"] → { socket, inUse, queue[] }
+ 生命周期: getConnection(复用/排队/新建) → 采集 → releaseConnection(交付下个等待者)
+ 空闲回收: 每 5 分钟清理 > 10 分钟未用的空闲连接
+ 断线恢复: socket.destroyed 检测 → destroyConnection → getConnection 重建
 ```
 
 ---
@@ -219,18 +225,26 @@ msg.payload = {
 | 维度 | 本节点 | mcprotocol |
 |------|--------|------------|
 | 点位数量 | **N 个 / 节点** | 1 个 / 节点 |
-| 批量优化 | **智能聚类合并** | 逐地址独立请求 |
-| 数据类型 | **6 种** (INT16/UINT16/INT32/UINT32/FLOAT32/BOOL) | 仅 INT16 |
+| 连接模型 | 🆕 **长连接池 + 请求队列** | 短连接 (每请求新建销毁) |
+| TCP 断线恢复 | 🆕 **自动检测重建** | ⚠️ 已知 BUG (不自恢复) |
+| TCP Keepalive | 🆕 **30s 探测** | ❌ |
+| 批量优化 | **智能聚类合并** | 库内优化 (黑盒) |
+| 数据类型 | **6 种** (INT16/UINT16/INT32/UINT32/FLOAT32/BOOL) | 基础类型 |
 | 位元件 | **自动拆包** | 不支持 |
 | 斜率偏移变换 | **内置** `rawValue × slope + offset` | 无 |
 | 32位/浮点 | **自动读相邻寄存器 + 拼接** | 无 |
 | serialNo | **每帧自增 + 回显校验** | 固定不变 |
-| 错误诊断 | 19 个 MC 错误码可读 | "timeout" |
+| 动态 IP 覆盖 | 🆕 `msg.payload.plcIp` | ❌ |
+| deviceId 归一化 | 🆕 输出始终为数字 | ❌ |
 | 模拟模式 | ✅ `mcSimulationMode=true` | ❌ |
-| deviceId 输出 | ✅ 适配 pg-store 分表 | ❌ |
-| regType 输出 | ✅ 适配 pg-store 列映射 | ❌ |
+| 写入能力 | ❌ (仅读) | ✅ mcprotocol-write |
+| UDP 支持 | ❌ (仅 TCP) | ✅ |
+| 1E 帧 / ASCII | ❌ (仅 3E/4E) | ✅ |
+| 错误诊断 | 19 个 MC 错误码可读 | 基础 |
 | 依赖 | **0** (纯 Node.js) | mcprotocol 依赖 |
-| 维护状态 | ✅ 活跃 | ⚠️ issue 长期未处理 |
+| 维护状态 | ✅ 活跃 (2026-07) | ⚠️ 停更 (2021-01) |
+
+> **选择建议**：需要写入/UDP/1E帧/老A系列PLC → mcprotocol。高频多PLC TCP采集 → 本节点。
 
 ---
 
@@ -262,11 +276,11 @@ mcSimulationMode: true
 
 ## FAQ
 
-**Q: 为什么不用连接池？**  
-MC 协议是无状态短连接。每次采集建立 TCP → 发送帧 → 接收响应 → 关闭。用连接池不会带来性能提升（TCP 握手开销远小于 PLC 扫描周期），反而有状态泄漏风险。
+**Q: 连接如何管理？**  
+采用**长连接池**架构（v1.2.0+）。TCP 连接建立后保持复用，跨轮采集不再重复握手。同一 PLC 的多个采集节点通过**请求队列串行化**，防止并发读写交错。连接空闲 > 10 分钟自动回收，断开自动检测重建。生产环境推荐长连接池模式。
 
 **Q: 能同时读多个 PLC 吗？**  
-可以。每个 `PLC 连接配置` 配置一个 PLC。多个 `MC 读取` 节点关联不同配置即可。全局锁按 `host:port` 隔离，不同 PLC 并行执行。
+可以。每个 `PLC 连接配置` 配置一个 PLC。多个 `MC 读取` 节点关联不同配置即可。连接池按 `host:port` 隔离，不同 PLC 独立管理各自的 TCP 连接。同一 PLC 多节点场景通过队列串行化保证安全。
 
 **Q: 点位地址能写成 "D100" 格式吗？**  
 可以。地址字段兼容 `"D100"` 格式（自动提取数字部分），也支持纯数字 `100`。
