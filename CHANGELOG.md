@@ -1,4 +1,24 @@
-## v1.3.1 (2026-07-17)
+## v1.4.0 (2026-07-18)
+- FIX: INT32/UINT32 高低字顺序修正（D0 为低字，D1 为高字）
+- FIX: X/Y 位元件地址按三菱八进制解析与显示
+- FIX: 4E 帧始终携带序列号字段，兼容严格 PLC 实现
+- FIX: 位元件批量字数上限统一为 960 字（15360 点）
+- FIX: 32 位类型自动扩展读取范围以包含相邻寄存器
+- FIX: 数据处理器异常时正确标记失败并继续后续组
+- FIX: deviceId hash 边界值处理（`Math.abs` 负数问题）
+- FIX: Buffer 溢出判断前置于 `Buffer.concat`
+- FIX: frameType 支持大小写不敏感
+- ENHANCE: 连接池 key 增加帧格式/网络号/站号，避免不同配置冲突
+- ENHANCE: 并发建连请求串行化，防止同一 PLC 建立多个 socket
+- ENHANCE: socket 增加 `end`/`close` 监听，快速检测干净断连
+- ENHANCE: 连接失败指数退避，避免重连风暴
+- ENHANCE: 队列请求增加超时机制
+- ENHANCE: 输入节流时输出失败消息，不再静默丢弃
+- ENHANCE: 支持 Node-RED 1.0+ `done()` 回调
+- ENHANCE: 全局清理定时器在最后一个节点关闭时停止
+- TEST: 新增单元测试覆盖帧构造、解码、连接池
+
+
 - FIX: 计算点位 — operator/referenceTag 未写入 validTags 导致计算失效
 - FIX: 计算点位 — 32位类型用 convertedValue（全解码值），非 rawValue（低16位）
 - FIX: CSV 导入 — 字段映射冗余 fallback 修正

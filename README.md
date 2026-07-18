@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/npm/l/node-red-contrib-mitsubishi.svg)](LICENSE)
 [![Node-RED](https://img.shields.io/badge/Node--RED-%E2%89%A53.0.0-red.svg)](https://nodered.org)
 
-三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读 N 个点位，零外部依赖，纯 TCP 长连接池实现。**
+三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读 N 个点位，零外部依赖，纯 TCP 长连接池实现，已修复 INT32/UINT32、X/Y 八进制、连接池并发等生产级问题。**
 
 ---
 
@@ -33,11 +33,14 @@
 ## 特性
 
 - **独立可用** — 纯 Node.js `net` + `Buffer`，不依赖任何第三方库或后端服务
-- **长连接池** 🆕 — TCP 连接持久复用，省端口 + 省握手，跨轮采集无需重复建连
-- **请求队列串行化** 🆕 — 多节点共享同一 PLC 时自动排队，防止读写交错
-- **TCP Keepalive** 🆕 — 30 秒探测保活，防止空闲连接被交换机/防火墙断开
-- **断线自动重建** 🆕 — 连接断开或超时自动检测并重建，对上层透明
-- **deviceId 归一化** 🆕 — 输出始终为数字，兼容下游 `edge_commStatus` 索引
+- **长连接池** — TCP 连接持久复用，键含帧/网络/站号，避免不同配置冲突
+- **请求队列串行化** — 多节点共享同一 PLC 时自动排队，防止读写交错
+- **并发建连保护** — 同一 PLC 同时只建立一个 TCP 连接
+- **TCP Keepalive** — 30 秒探测保活，防止空闲连接被交换机/防火墙断开
+- **断线自动重建** — 连接断开、超时或干净关闭时自动检测并重建
+- **重连退避** — 连接失败时指数退避，避免重连风暴
+- **队列超时** — 排队请求超过超时时间自动失败，不无限等待
+- **deviceId 归一化** — 输出始终为数字，兼容下游 `edge_commStatus` 索引
 - **表格编辑器** — 一个节点配置 N 个点位，自动按寄存器类型和地址聚类，合并为批量读取
 - **6 种数据类型** — INT16 / UINT16 / INT32 / UINT32 / FLOAT32 / BOOL
 - **8 种软元件** — D / W / R / X / Y / M / L / B，位元件（X/Y/M/L/B）自动逐位拆包
@@ -203,19 +206,19 @@ msg.payload = {
 
 ```
 ┌──────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
-│ inject / │     │     mitsubishi-read v1.2.2            │     │ 三菱 PLC │
+│ inject / │     │     mitsubishi-read v1.4.0            │     │ 三菱 PLC │
 │ 动态tags │────→│                                       │────→│          │
-└──────────┘     │  1. 校验 + 清洗点位                   │     │ Q / L /  │
+└──────────┘     │  1. 校验 + 清洗点位（X/Y 八进制）    │     │ Q / L /  │
                  │  2. 去重 + 聚类分组                   │     │ iQ-R /   │
                  │  3. 长连接池 ──→ 逐组 3E/4E 帧请求   │     │ FX5U     │
                  │  4. 解码 + 斜率变换                   │     └──────────┘
                  │  5. 输出 {raw,eng,quality,ts}         │
                  └──────────────────────────────────────┘
 
- 连接池: CONN_POOL["host:port"] → { socket, inUse, queue[] }
+ 连接池: CONN_POOL["host:port:frame:network:station"] → { socket, inUse, queue[] }
  生命周期: getConnection(复用/排队/新建) → 采集 → releaseConnection(交付下个等待者)
  空闲回收: 每 5 分钟清理 > 10 分钟未用的空闲连接
- 断线恢复: socket.destroyed 检测 → destroyConnection → getConnection 重建
+ 断线恢复: socket close/end/destroyed 检测 → destroyConnection → getConnection 重建
 ```
 
 ---
@@ -274,16 +277,32 @@ mcSimulationMode: true
 
 ---
 
+## 测试
+
+```bash
+npm install
+npm test
+```
+
+测试覆盖：
+
+- 3E/4E 帧构造字节级正确性
+- INT32/UINT32/FLOAT32 高低字解码
+- X/Y 八进制地址解析与格式化
+- parseMCResponse 对正常响应、MC 错误码、序列号不匹配的处理
+- 节点模拟模式与 deviceId 解析
+
 ## FAQ
 
 **Q: 连接如何管理？**  
-采用**长连接池**架构（v1.2.0+）。TCP 连接建立后保持复用，跨轮采集不再重复握手。同一 PLC 的多个采集节点通过**请求队列串行化**，防止并发读写交错。连接空闲 > 10 分钟自动回收，断开自动检测重建。生产环境推荐长连接池模式。
+采用**长连接池**架构（v1.4.0）。TCP 连接建立后保持复用，跨轮采集不再重复握手。连接池 key 包含 `host:port:frame:network:station`，不同帧格式/网络号/站号的 PLC 不会复用同一条连接。同一 PLC 的多个采集节点通过**请求队列串行化**，防止并发读写交错。连接空闲 > 10 分钟自动回收，断开自动检测重建。生产环境推荐长连接池模式。
 
 **Q: 能同时读多个 PLC 吗？**  
-可以。每个 `PLC 连接配置` 配置一个 PLC。多个 `MC 读取` 节点关联不同配置即可。连接池按 `host:port` 隔离，不同 PLC 独立管理各自的 TCP 连接。同一 PLC 多节点场景通过队列串行化保证安全。
+可以。每个 `PLC 连接配置` 配置一个 PLC，或在运行时通过 `msg.payload.plcIp` / `msg.payload.protocolParams` 动态覆盖。连接池按 `host:port:frame:network:station` 隔离，不同 PLC 独立管理各自的 TCP 连接。同一 PLC 多节点场景通过队列串行化保证安全。
 
 **Q: 点位地址能写成 "D100" 格式吗？**  
-可以。地址字段兼容 `"D100"` 格式（自动提取数字部分），也支持纯数字 `100`。
+可以。地址字段兼容 `"D100"` 格式（自动提取数字部分），也支持纯数字 `100`。  
+> **注意**：`X` / `Y` 为三菱八进制地址，输入 `X10` 表示物理点 `X10`（八进制），内部会自动转换为十进制处理，输出 ID 也保持八进制显示。`M` / `L` / `B` 仍为十进制。
 
 **Q: switch 元素一次最多读多少个点位？**  
 字元件单次最多 960 字，位元件单次最多 15360 点。超出自动拆组，无需手动干预。
