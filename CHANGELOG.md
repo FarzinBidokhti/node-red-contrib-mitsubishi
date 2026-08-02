@@ -1,3 +1,27 @@
+## v1.5.1 (2026-07-28)
+- **FEAT: 写入节点 `mitsubishi-write`（新）** — 批量字写入（0x1401）、TCP/UDP 双传输、独立写连接池、per-PLC 轮次闸、值校验钳制（UINT16/INT16/INT32）、X 写入警告、SIM 模式；输出 `data[tagId]={value,quality,ts}`
+- **FEAT: 位设备原生位写**（0x1401 子指令 0x0001）— M/X/Y/L/B 单往返写入，替代 RMW 消除竞态；nibble 打包与 pymcprotocol 对拍一致；RMW 仅保留"字内位"（D100.3）场景
+- **FIX: 写分组严格连续**（`groupTagsContiguous`）— 杜绝间隙填 0 清空 PLC 未配置地址（字写/位写同类问题，两轮修复）；写帧 `dataLen=12+2n` 修正（旧版少 2 字节，真机必报帧长错误）
+- **FIX: read 侧请求级超时回调**（`_tmoHandler(mcSocket)()` → `_tmoHandler()`，真实超时路径 TypeError）+ 回归测试
+- **FIX: 分组改为 960 字 span 感知聚类**（`groupTags`，万点 11 帧替代旧 cluster<50 的 200+ 帧）；addr=0 合法化（D0/M0/X0）；FX 八进制含 8/9 拒绝；响应帧型严格校验；FLOAT32/applyTransform/计算点位去 toFixed(4)；UDP RMW `_closed` 释放；UINT16 负数/INT32 越界钳制
+- **TEST: 91 项** — 写帧 golden buffer（含 dataLen 断言）、encode↔decode 往返对称、连续/间隙分组、原生位写、RMW、请求级超时、10k 压测
+
+## v1.4.4 (2026-07-27)
+- **FEAT: UDP 传输支持** — `mitsubishi-config` 新增 `protocol: tcp|udp`（默认 tcp 兼容存量）；新增 `nodes/mc-udp.js` 会话层（共享 dgram socket、单在途串行化、ICMP 仅失败当前请求、迟到包丢弃、空闲 10min 回收、close 释放）；3E/4E 帧在 UDP 下与 TCP 完全一致（SLMP 原生支持）
+- **FIX: 32/64 位数据断线（重要）** — emit 的 `rawValue` 现在输出**解码后的值**（INT32/UINT32/FLOAT32/DOUBLE 多字组装结果），原首字保留在 `rawWord` 备查；此前下游只消费 `rawValue` 导致 32/64 位点位只入库第一个字
+- **FIX: 4E 帧布局按 SLMP 规范重排** — 序列号+固定值 0000 进副标题（偏移 2-5）、数据长=0x0C（旧误为 0x0E）、总长 25 字节；响应解析 endCode@13/dataStart=15/minLen=15（旧 @9/13/11）；TCP 分帧偏移同步修正；golden buffer 对拍测试（参照 pymcprotocol/SH-080008）
+- **FIX: X/Y 地址进制规则** — 仅 FX(iQ-F) 系列为 8 进制，Q/L/iQ-R 均为 16 进制（旧注释"Q 系为 8 进制"有误）；`mitsubishi-config` 新增 `series` 字段（Q/L/iQ-R/FX）
+- **FIX: 连接池 `_closed` 中止路径泄漏** — 全部 6 处关闭中止点统一 `releaseConnection`，重部署落在读取窗口不再楔死连接
+- **FEAT: per-PLC 轮次闸** — 同 PLC 上轮未结束时新轮次直接失败返回（`Round in progress`），替代池队列积压过期数据；close 时清理防跨部署泄漏
+- **FEAT: 错误可被 catch 节点捕获** — 所有失败路径 `node.error(text, msg)`（帧白名单/无有效点/无组/节流/闸/连接失败/连接丢失）
+- **FEAT: 编辑器对齐运行时能力** — 点位表格新增 字节序/字序/位偏移 三列（CSV 导入导出同步）；config 新增 PLC 系列与传输协议
+- **FEAT: 分组改为 960 字 span 感知聚类**（万点级采集）— 替代旧 `cluster<50` 拍脑袋值：1 万连续 INT16 从 200+ 帧降到 11 帧；`groupTags` 提取至 mc-protocol 可单测（INT16/INT32/DOUBLE/位元件/混排全覆盖）
+- **FIX: bitOffset 钳制 0-15**（越界告警并归 0）；地址上限 0xFFFFFF 校验（超限拒绝而非静默截断）
+- **FIX: slope=0 合法化** — `applyTransform` 不再被 `||1` 吞掉；未知 dataType 回退原值
+- **REFACTOR: 解码逻辑提取** — 内联解码提取为 `mc.decodeTag`（可单测，行为不变）；TCP/UDP 输出装配共享 `assembleAndSend()`
+- **TEST: 测试套件重建** — 3E/4E golden buffer 对拍、X/Y 进制、decodeTag 全组合、UDP 端到端（dgram 模拟 PLC：3E 解码/4E 序列号回显/丢包重试）——43 passing
+- **二次审查修复（review#1-9）**：FX 八进制地址含 8/9 直接拒绝（旧 parseInt('18',8) 静默截断为 1）；响应帧型与请求帧型严格校验（3E↔D0/4E↔D4）；build 帧 wordCount 1-960 函数级守卫；FLOAT32/applyTransform/计算点位去除 toFixed(4) 精度截断；TCP 增加请求级兜底定时器（防慢滴漏响应绕过 socket 空闲超时）；删除批次拆分 subMax 死变量；mc-udp releaseNode 幂等性注释。未采纳：#2（JS 单线程模型下检查与回调同步执行无竞态窗口）、#5（EventEmitter 监听器按注册顺序同步执行，且建议修法会去掉 socket 错误重连韧性）
+
 ## v1.4.2 (2026-07-18)
 - CHORE: 发布 v1.4.2
 

@@ -1,12 +1,13 @@
 {
   "name": "node-red-contrib-mitsubishi",
-  "version": "1.4.2",
-  "description": "三菱 MC Protocol 3E/4E 采集节点 — 纯TCP长连接池, 零依赖, 支持Q/L/iQ-R/iQ-F/FX5U",
+  "version": "1.5.1",
+  "description": "三菱 MC Protocol 3E/4E 读写节点 — TCP/UDP 双传输, 批量字写+原生位写+RMW, 960字聚类万点采集, 91项测试, 零依赖, 支持Q/L/iQ-R/iQ-F/FX5U",
   "main": "nodes/mitsubishi-read.js",
   "node-red": {
     "nodes": {
       "mitsubishi-config": "nodes/mitsubishi-config.js",
-      "mitsubishi-read": "nodes/mitsubishi-read.js"
+      "mitsubishi-read": "nodes/mitsubishi-read.js",
+      "mitsubishi-write": "nodes/mitsubishi-write.js"
     }
   },
   "repository": {

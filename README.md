@@ -4,7 +4,20 @@
 [![license](https://img.shields.io/npm/l/node-red-contrib-mitsubishi.svg)](LICENSE)
 [![Node-RED](https://img.shields.io/badge/Node--RED-%E2%89%A53.0.0-red.svg)](https://nodered.org)
 
-三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读 N 个点位，零外部依赖，纯 TCP 长连接池实现，已修复 INT32/UINT32、X/Y 八进制、连接池并发等生产级问题。**
+三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读/写 N 个点位，零外部依赖，TCP 长连接池 + UDP 会话双传输，91 项测试含规范对拍与万点压测。**
+
+> **v1.5.1（2026-07-28）写入能力**
+> - **新增 `mitsubishi-write` 写节点**：批量字写入（0x1401）+ **位设备原生位写**（0x1401/0x0001，M/X/Y/L/B 单往返无竞态），TCP/UDP 双传输；值校验钳制、X 写入警告、SIM 模式。
+> - **写安全设计（重要）**：写分组严格连续——**绝不向未配置的中间地址写 0**（间隙即拆组，杜绝批量写误清 PLC 数据）；写帧 dataLen 按 SLMP 规范修正。
+> - **万点采集**：960 字 span 感知聚类，1 万连续点位仅 11 帧（旧版 200+ 帧）。
+> - 详见 CHANGELOG（v1.5.1 含写入节点、原生位写、连续分组、dataLen 修正、请求级超时回归等 91 项测试）。
+
+> **v1.4.4（2026-07-27）重要变更**
+> - **UDP 传输**：`mitsubishi-config` 新增"传输协议"（tcp/udp，默认 tcp 兼容存量）。UDP 为无连接模式：共享 dgram socket、单在途串行化、超时重试、ICMP 仅失败当前请求。适用 QJ71E71/CPU 内置以太网的 UDP 通道。
+> - **32/64 位数据断线修复**：输出 `rawValue` 现在是**解码后的值**（FLOAT32/INT32/DOUBLE 等多字组装结果），原始首字移到 `rawWord`。此前 32/64 位点位下游只能拿到第一个字。
+> - **4E 帧按 SLMP 规范重排**：序列号+固定值进副标题、数据长 0x0C、响应 endCode@13/data@15（旧布局与真机不兼容）。3E 不变。
+> - **X/Y 地址进制修正**：仅 FX(iQ-F) 系列为 8 进制，Q/L/iQ-R 均为 16 进制；config 新增"PLC 系列"字段。
+> - 其余：连接池 `_closed` 泄漏修复、per-PLC 轮次闸、错误可被 catch 节点捕获、编辑器补 字节序/字序/位偏移 列、bitOffset 钳制 0-15、slope=0 合法化。详见 CHANGELOG。
 
 ---
 
@@ -232,22 +245,24 @@ msg.payload = {
 | TCP 断线恢复 | 🆕 **自动检测重建** | ⚠️ 已知 BUG (不自恢复) |
 | TCP Keepalive | 🆕 **30s 探测** | ❌ |
 | 批量优化 | **智能聚类合并** | 库内优化 (黑盒) |
-| 数据类型 | **6 种** (INT16/UINT16/INT32/UINT32/FLOAT32/BOOL) | 基础类型 |
-| 位元件 | **自动拆包** | 不支持 |
+| 数据类型 | **7 种** (INT16/UINT16/INT32/UINT32/FLOAT32/FLOAT64/BOOL) | 基础类型 |
+| 位元件 | **自动拆包 + 原生位写** | 不支持 |
 | 斜率偏移变换 | **内置** `rawValue × slope + offset` | 无 |
 | 32位/浮点 | **自动读相邻寄存器 + 拼接** | 无 |
 | serialNo | **每帧自增 + 回显校验** | 固定不变 |
 | 动态 IP 覆盖 | 🆕 `msg.payload.plcIp` | ❌ |
 | deviceId 归一化 | 🆕 输出始终为数字 | ❌ |
 | 模拟模式 | ✅ `mcSimulationMode=true` | ❌ |
-| 写入能力 | ❌ (仅读) | ✅ mcprotocol-write |
-| UDP 支持 | ❌ (仅 TCP) | ✅ |
+| 写入能力 | ✅ **字批量写 + 位原生写 + RMW**（v1.5.1） | ✅ mcprotocol-write |
+| 写安全 | ✅ **严格连续分组，绝不向间隙写 0**（v1.5.1） | ⚠️ 批量写连续覆盖 |
+| 测试 | ✅ **91 项（规范对拍/万点压测/读写 e2e）** | ❌ 无 |
+| UDP 支持 | ✅ **UDP 会话层**（v1.4.4） | ✅ |
 | 1E 帧 / ASCII | ❌ (仅 3E/4E) | ✅ |
 | 错误诊断 | 19 个 MC 错误码可读 | 基础 |
 | 依赖 | **0** (纯 Node.js) | mcprotocol 依赖 |
 | 维护状态 | ✅ 活跃 (2026-07) | ⚠️ 停更 (2021-01) |
 
-> **选择建议**：需要写入/UDP/1E帧/老A系列PLC → mcprotocol。高频多PLC TCP采集 → 本节点。
+> **选择建议**：需要 1E 帧/ASCII 模式/老 A 系列 PLC/T·C·SM 等全软元件家族 → mcprotocol。读写高频采集、万点级规模、要测试护栏与写安全 → 本节点。
 
 ---
 

@@ -83,14 +83,17 @@ D,101,INT16,1,0,,,压力,temp_002"></textarea>
           <th style="width:3%"><input type="checkbox" id="tag-select-all" onchange="tagEditor.toggleAll(this.checked)" title="全选"></th>
           <th style="width:7%;text-align:left">寄存器</th>
           <th style="width:6%;text-align:left">地址</th>
-          <th style="width:11%;text-align:left">数据类型</th>
-          <th style="width:7%;text-align:left">斜率</th>
-          <th style="width:7%;text-align:left">偏移</th>
-          <th style="width:7%;text-align:left">运算</th>
-          <th style="width:13%;text-align:left">引用ID</th>
-          <th style="width:14%;text-align:left">名称</th>
+          <th style="width:9%;text-align:left">数据类型</th>
+          <th style="width:8%;text-align:left" title="字节序：16 位字内高低字节是否交换">字节序</th>
+          <th style="width:7%;text-align:left" title="字序：32/64 位类型高低字先后">字序</th>
+          <th style="width:5%;text-align:left" title="位偏移：BOOL 取字内第几位(0-15)">位</th>
+          <th style="width:6%;text-align:left">斜率</th>
+          <th style="width:6%;text-align:left">偏移</th>
+          <th style="width:6%;text-align:left">运算</th>
+          <th style="width:11%;text-align:left">引用ID</th>
+          <th style="width:11%;text-align:left">名称</th>
           <th style="width:4%"></th>
-          <th style="width:11%;text-align:left">ID</th>
+          <th style="width:9%;text-align:left">ID</th>
         </tr>
       </thead>
       <tbody id="tags-tbody"></tbody>
@@ -126,7 +129,7 @@ D,101,INT16,1,0,,,压力,temp_002"></textarea>
     },
 
     add: function () {
-      this.rows.push({ id: '', regType: 'D', addr: '', dataType: 'INT16', slope: '1', offset: '0', operator: '', referenceTag: '', name: '' });
+      this.rows.push({ id: '', regType: 'D', addr: '', dataType: 'INT16', byteOrder: '', wordOrder: '', bitOffset: '', slope: '1', offset: '0', operator: '', referenceTag: '', name: '' });
       this.render();
       this.save();
     },
@@ -195,6 +198,7 @@ D,101,INT16,1,0,,,压力,temp_002"></textarea>
         this.rows.push({
           id: row.id || '', regType: row.regType || 'D',
           addr: row.addr || '', dataType: row.dataType || 'INT16',
+          byteOrder: row.byteOrder || '', wordOrder: row.wordOrder || '', bitOffset: row.bitOffset || '',
           slope: row.slope || '1', offset: row.offset || '0',
           operator: row.operator || '', referenceTag: row.referenceTag || '',
           name: row.name || ''
@@ -210,10 +214,10 @@ D,101,INT16,1,0,,,压力,temp_002"></textarea>
     },
 
     exportCSV: function () {
-      var csv = 'regType,addr,dataType,slope,offset,operator,referenceTag,name,id\n';
+      var csv = 'regType,addr,dataType,byteOrder,wordOrder,bitOffset,slope,offset,operator,referenceTag,name,id\n';
       for (var i = 0; i < this.rows.length; i++) {
         var r = this.rows[i];
-        csv += [r.regType||'', r.addr||'', r.dataType||'', r.slope||'1', r.offset||'0', r.operator||'', r.referenceTag||'', r.name||'', r.id||''].join(',') + '\n';
+        csv += [r.regType||'', r.addr||'', r.dataType||'', r.byteOrder||'', r.wordOrder||'', r.bitOffset||'', r.slope||'1', r.offset||'0', r.operator||'', r.referenceTag||'', r.name||'', r.id||''].join(',') + '\n';
       }
       var blob = new Blob(['﻿' + csv], {type: 'text/csv;charset=utf-8'});
       var url = URL.createObjectURL(blob);
@@ -263,6 +267,19 @@ D,101,INT16,1,0,,,压力,temp_002"></textarea>
         var dt = mkSel(['INT16','UINT16','INT32','UINT32','FLOAT32','BOOL'], row.dataType || 'INT16');
         dt.on('change', function () { self.update(idx, 'dataType', $(this).val()); });
         tr.append($('<td>').append(dt));
+
+        // 🔧 v1.4.4: 字节序/字序/位偏移（编辑器与运行时能力对齐）
+        var bo = mkSel(['','LITTLE_ENDIAN','BIG_ENDIAN'], row.byteOrder || '');
+        bo.on('change', function () { self.update(idx, 'byteOrder', $(this).val()); });
+        tr.append($('<td>').append(bo));
+
+        var wo = mkSel(['','LOW_FIRST','HIGH_FIRST'], row.wordOrder || '');
+        wo.on('change', function () { self.update(idx, 'wordOrder', $(this).val()); });
+        tr.append($('<td>').append(wo));
+
+        var bit = mkInp(row.bitOffset, '0-15', 'number', '80%');
+        bit.on('change', function () { self.update(idx, 'bitOffset', $(this).val()); });
+        tr.append($('<td>').append(bit));
 
         // 斜率
         var sl = mkInp(row.slope, '1', 'number', '85%');
