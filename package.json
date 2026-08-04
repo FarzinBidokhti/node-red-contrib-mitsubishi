@@ -23,6 +23,7 @@
   },
   "files": [
     "nodes/",
+    "docs/",
     "images/",
     "CHANGELOG.md",
     "LICENSE",
