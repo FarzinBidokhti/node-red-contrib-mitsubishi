@@ -483,7 +483,7 @@ module.exports = function (RED) {
             case 'div': result = b !== 0 ? a / b : null; break;
           }
           if (result != null) {
-            thisEntry.rawValue = result;  // 🔧 review#3: 不再 toFixed(4) 截断
+            thisEntry.rawValue = mc.roundEng(result);  // 🔧 v1.6.0: 计算点位同步去浮点算术尾巴
             thisEntry.engValue = mc.applyTransform(result, t);
           }
         });

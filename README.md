@@ -4,20 +4,30 @@
 [![license](https://img.shields.io/npm/l/node-red-contrib-mitsubishi.svg)](LICENSE)
 [![Node-RED](https://img.shields.io/badge/Node--RED-%E2%89%A53.0.0-red.svg)](https://nodered.org)
 
-三菱 MC Protocol 3E/4E 以太网采集节点。**一个节点读/写 N 个点位，零外部依赖，TCP 长连接池 + UDP 会话双传输，91 项测试含规范对拍与万点压测。**
+三菱 MC Protocol（SLMP）3E/4E 读写节点。**一个节点读/写 N 个点位，零外部依赖，TCP 长连接池 + UDP 会话双传输，Binary/ASCII 双通信模式，104 项测试含规范对拍与万点压测。**
+
+支持 Q / L / iQ-R / iQ-F（FX5U）/ FX3U+以太网模块，适配 EdgeLink 采集管线（输出可直接被 `edgelink-pg-store` 识别入库）。
+
+> **v1.6.0（2026-08-02）**
+> - **写入表格新增「默认值」列** — 面板配好静态值，任意消息触发即整表写入，临时写固定值调试不再需要 function 节点
+> - **`msg.tags` 改为与面板表格合并**（原来是全量覆盖）— msg 只带 `{id, value}` 即可按 id（或 regType+addr）匹配面板行补齐定义；未被 msg 引用的面板行本轮**不执行**（写操作有副作用，防误写）
+> - **engValue 浮点尾巴修复** — `27862 × 0.1` 输出 `2786.2` 而非 `2786.2000000000003`（10 位小数舍入，小值精度不丢）
+> - 详见 [CHANGELOG](CHANGELOG.md)
 
 > **v1.5.1（2026-07-28）写入能力**
-> - **新增 `mitsubishi-write` 写节点**：批量字写入（0x1401）+ **位设备原生位写**（0x1401/0x0001，M/X/Y/L/B 单往返无竞态），TCP/UDP 双传输；值校验钳制、X 写入警告、SIM 模式。
-> - **写安全设计（重要）**：写分组严格连续——**绝不向未配置的中间地址写 0**（间隙即拆组，杜绝批量写误清 PLC 数据）；写帧 dataLen 按 SLMP 规范修正。
-> - **万点采集**：960 字 span 感知聚类，1 万连续点位仅 11 帧（旧版 200+ 帧）。
-> - 详见 CHANGELOG（v1.5.1 含写入节点、原生位写、连续分组、dataLen 修正、请求级超时回归等 91 项测试）。
+> - **新增 `mitsubishi-write` 写节点**：批量字写入（0x1401）+ **位设备原生位写**（子指令 0x0001，M/X/Y/L/B 单往返无竞态），TCP/UDP 双传输
+> - **写安全设计**：写分组严格连续——**绝不向未配置的中间地址写 0**（间隙即拆组，杜绝批量写误清 PLC 数据）
+> - **万点采集**：960 字 span 感知聚类，1 万连续点位仅 11 帧（旧版 200+ 帧）
 
-> **v1.4.4（2026-07-27）重要变更**
-> - **UDP 传输**：`mitsubishi-config` 新增"传输协议"（tcp/udp，默认 tcp 兼容存量）。UDP 为无连接模式：共享 dgram socket、单在途串行化、超时重试、ICMP 仅失败当前请求。适用 QJ71E71/CPU 内置以太网的 UDP 通道。
-> - **32/64 位数据断线修复**：输出 `rawValue` 现在是**解码后的值**（FLOAT32/INT32/DOUBLE 等多字组装结果），原始首字移到 `rawWord`。此前 32/64 位点位下游只能拿到第一个字。
-> - **4E 帧按 SLMP 规范重排**：序列号+固定值进副标题、数据长 0x0C、响应 endCode@13/data@15（旧布局与真机不兼容）。3E 不变。
-> - **X/Y 地址进制修正**：仅 FX(iQ-F) 系列为 8 进制，Q/L/iQ-R 均为 16 进制；config 新增"PLC 系列"字段。
-> - 其余：连接池 `_closed` 泄漏修复、per-PLC 轮次闸、错误可被 catch 节点捕获、编辑器补 字节序/字序/位偏移 列、bitOffset 钳制 0-15、slope=0 合法化。详见 CHANGELOG。
+---
+
+## 节点一览
+
+| 节点 | 类型 | 说明 |
+|------|------|------|
+| `PLC 连接配置` | config | 存储 PLC IP、端口、帧格式、系列、传输协议等连接参数 |
+| `MC 读取` | input | 点位表格批量采集，输出 `{rawValue, engValue, quality, ts}` |
+| `MC 写入` | output | 点位表格批量写入，支持静态默认值与 msg 动态值 |
 
 ---
 
@@ -38,6 +48,7 @@
 | 读 50 个点位 | 拖 50 个节点 | **拖 1 个节点，填表格** |
 | 读 D200 是 FLOAT32 | 自己写 function 解码 | **表格选 FLOAT32，自动解码** |
 | 原始值 2530 → 实际 253.0℃ | 自己写 function 换算 | **填斜率 0.1，自动变换** |
+| 临时写个固定值调试 | 写 function 拼报文 | **表格填默认值，inject 一点就写** |
 | PLC 返回错误码 0xC052 | 只会说 "timeout" | **"Address out of range"** |
 | serialNo 不递增 | 4E 帧可能串包 | **每帧自增 + 响应校验** |
 
@@ -45,26 +56,40 @@
 
 ## 特性
 
-- **独立可用** — 纯 Node.js `net` + `Buffer`，不依赖任何第三方库或后端服务
-- **长连接池** — TCP 连接持久复用，键含帧/网络/站号，避免不同配置冲突
-- **请求队列串行化** — 多节点共享同一 PLC 时自动排队，防止读写交错
-- **并发建连保护** — 同一 PLC 同时只建立一个 TCP 连接
-- **TCP Keepalive** — 30 秒探测保活，防止空闲连接被交换机/防火墙断开
-- **断线自动重建** — 连接断开、超时或干净关闭时自动检测并重建
-- **重连退避** — 连接失败时指数退避，避免重连风暴
-- **队列超时** — 排队请求超过超时时间自动失败，不无限等待
-- **deviceId 归一化** — 输出始终为数字，兼容下游 `edge_commStatus` 索引
-- **表格编辑器** — 一个节点配置 N 个点位，自动按寄存器类型和地址聚类，合并为批量读取
-- **6 种数据类型** — INT16 / UINT16 / INT32 / UINT32 / FLOAT32 / BOOL
-- **8 种软元件** — D / W / R / X / Y / M / L / B，位元件（X/Y/M/L/B）自动逐位拆包
-- **斜率偏移变换** — `engValue = rawValue × slope + offset`，节点直接输出工程值
-- **动态 IP 覆盖** — `msg.payload.plcIp` 可覆盖 config 固定 IP，一个节点采多台 PLC
-- **4E serialNo 完整支持** — 每帧自增，响应校验，防止串包
-- **批量保护** — 单次读取字数超 960 自动拆包，防 PLC 报 `0xC059`
-- **错误诊断** — 19 个 MC 错误码映射为中文/英文可读信息
-- **模拟模式** — `RED.settings.mcSimulationMode = true` 不连 PLC 即可测试
-- **零依赖** — 仅使用 Node.js 内置 `net` + `Buffer`
-- **防重入保护** — `safeSend` 确保每次触发只输出一条消息
+### 采集（MC 读取）
+
+- **表格编辑器** — 一个节点配置 N 个点位（支持上千点，分页 + CSV 导入导出 + 批量生成）
+- **7 种数据类型** — INT16 / UINT16 / INT32 / UINT32 / FLOAT32 / DOUBLE(FLOAT64) / BOOL
+- **8 种软元件** — D / W / R / X / Y / M / L / B，位元件自动逐位拆包
+- **智能聚类** — 960 字 span 感知分组，自动合并批量读取、超限自动拆组（防 PLC `0xC059`）
+- **斜率偏移变换** — `engValue = rawValue × slope + offset`，10 位小数舍入去浮点尾巴
+- **计算点位** — `this [+−×÷] ref` 由已有点位派生新值
+- **字节序/字序/位偏移** — 6 种字节序组合 + 字内取位（D100.3）
+
+### 写入（MC 写入）
+
+- **批量字写入**（0x1401）— 同组连续地址单帧写入，**严格连续分组，绝不向间隙写 0**
+- **原生位写**（子指令 0x0001）— M/X/Y/L/B 单往返写入，替代 RMW 消除竞态
+- **字内位 RMW** — D100.3 场景自动读-改-写
+- **静态默认值列** — 面板表格直接配写入值，inject 触发即可写
+- **动态写入** — `msg.tags` 按 id/地址与面板行合并，value 缺省回落默认值
+- **值收敛与安全** — BOOL 词表（true/1/on）、数值钳制、非法值**拒写**而不是静默写 0、X 写入警告
+
+### 连接与可靠性
+
+- **TCP 长连接池** — 读写双池独立，键含帧格式/网络号/站号；请求队列串行化，多节点共享 PLC 不交错
+- **UDP 会话层** — 共享 dgram socket、单在途串行化、ICMP 仅失败当前请求、迟到包丢弃
+- **断线自动重建** — close/end/timeout 检测 + 指数退避 + 并发建连保护
+- **TCP Keepalive** — 30 秒探测，防空闲连接被交换机/防火墙断开
+- **per-PLC 轮次闸** — 上轮未结束新轮次直接失败，杜绝过期数据积压
+
+### 工程化
+
+- **零依赖** — 纯 Node.js `net` / `dgram` / `Buffer`，无第三方库
+- **模拟模式** — `mcSimulationMode: true` 不连 PLC 即可离线开发/演示
+- **可读错误诊断** — 19 个 MC 错误码映射为可读信息，失败路径 `node.error` 可被 catch 节点捕获
+- **动态参数** — `msg.payload.plcIp` 覆盖 IP 一节点采多台 PLC；`protocolParams` 覆盖站号等
+- **104 项测试** — 帧级 golden buffer 对拍（参照 pymcprotocol/SH-080008）、编解码往返、万点 UDP 压测
 
 ---
 
@@ -75,12 +100,7 @@ cd ~/.node-red
 npm install node-red-contrib-mitsubishi
 ```
 
-重启 Node-RED，左侧节点栏 **edgelink** 分类下出现 `MC 读取` 节点。配置节点在 config 侧边栏：
-
-| 节点 | 类型 | 说明 |
-|------|------|------|
-| `PLC 连接配置` | config | 存储 PLC IP、端口、帧格式等连接参数 |
-| `MC 读取` | input/output | 配置点位表格，触发采集，输出数据 |
+重启 Node-RED，左侧节点栏 **edgelink** 分类下出现 `MC 读取` / `MC 写入`。
 
 ---
 
@@ -93,7 +113,7 @@ npm install node-red-contrib-mitsubishi
 | iQ-R | 4E | ✅ |
 | iQ-F（FX5U） | 4E | ✅ |
 | FX3U + 以太网模块（FX3U-ENET） | 3E | ✅ |
-| A 系列 | 1E / 2E | ❌ （仅支持 3E/4E） |
+| A 系列 | 1E / 2E | ❌（仅支持 3E/4E） |
 
 ---
 
@@ -109,13 +129,16 @@ npm install node-red-contrib-mitsubishi
 | IP 地址 | `192.168.1.10` | PLC 以太网模块 IP |
 | 端口 | `5007` | 3E 默认 5007 / 4E 默认 5008 |
 | 帧格式 | `3E` | 3E（Q/L/FX3U）或 4E（iQ-R/iQ-F/FX5U） |
+| PLC 系列 | `Q` | Q / L / iQ-R / FX（**仅 FX 的 X/Y 为 8 进制地址**，其余 16 进制） |
+| 传输协议 | `tcp` | TCP 长连接（默认）/ UDP 无连接（QJ71E71、CPU 内置以太网常用） |
+| 通信模式 | `Binary` | Binary（默认）/ ASCII（Hex 编码 + STX/ETX/校验和，部分老旧 PLC 只开 ASCII 口） |
 | 网络号 | `0` | 多跳网络用，直连填 0 |
 | 站号 | `0` | 目标站号，直连 CPU 填 0 |
-| 超时 (ms) | `3000` | TCP 读写超时 |
+| 超时 (ms) | `3000` | 读写超时 |
 | 重试次数 | `2` | 失败重试次数（不含首次） |
 | 重试间隔 (ms) | `300` | 重试等待时间 |
 
-### 2. 配置点位表格
+### 2. MC 读取：配置点位表格
 
 拖入 **`MC 读取`** 节点，关联 PLC 配置，在表格中添加点位：
 
@@ -126,17 +149,49 @@ npm install node-red-contrib-mitsubishi
 | X | 0 | BOOL | — | — | 开关 |
 | D | 300 | UINT16 | 1 | 0 | 计数器 |
 
-> **斜率/偏移公式**：`engValue = rawValue × slope + offset`
+> **斜率/偏移公式**：`engValue = rawValue × slope + offset`（结果按 10 位小数舍入，消除 `2786.2000000000003` 这类浮点尾巴）
 >
 > 例如 PLC 存温度原始值 2530（实际 253.0℃），设斜率 = 0.1，偏移 = 0，输出 engValue = 253.0
 
-### 3. 触发采集
-
 inject 节点 → MC 读取节点，部署后点击 inject 按钮即可采集。
 
-### 4. 动态点位（高级）
+### 3. MC 写入：三种写法
 
-上游节点传入 `msg.tags` 会覆盖表格配置，适配 EdgeLink 采集管线：
+拖入 **`MC 写入`** 节点，关联 PLC 配置。
+
+**① 静态写入（v1.6.0）** — 表格填点位 + **默认值**列，inject 触发即整表写入：
+
+| 寄存器 | 地址 | 数据类型 | ID | 默认值 |
+|--------|------|----------|------|--------|
+| D | 100 | INT16 | temp_set | 25.0 |
+| M | 0 | BOOL | m_start | true |
+
+**② 动态写入** — `msg.tags` 携带值，面板提供定义（合并而非覆盖）：
+
+```javascript
+msg.tags = [
+  { id: "temp_set", value: 30 },   // 按 id 匹配面板行：地址/类型用面板定义，value 覆盖默认值
+  { id: "m_start" }                // 不给 value → 回落面板默认值
+];
+node.send(msg);
+```
+
+> **合并规则（v1.6.0）**：msg 点位按 `id`（其次 `regType+addr`）匹配面板行补齐缺失字段；未被 msg 引用的面板行本轮**不执行**——静态默认值不会随动态轮次被误写。
+
+**③ 全动态写入** — 面板留空，msg 携带完整定义：
+
+```javascript
+msg.tags = [
+  { id: "sp1", regType: "D", addr: 100, dataType: "INT16", value: 42 },
+  { id: "b1", regType: "M", addr: 10, dataType: "BOOL", value: true }
+];
+```
+
+> **值规则**：BOOL 接受 `true/1/"1"/"true"/"on"`；数字直接给数值或数字字符串；**非法值拒写**（告警并跳过），不会静默写 0。无 value 且无默认值的点位跳过。
+
+### 4. 动态点位与动态参数（高级）
+
+上游传入 `msg.tags` 可完全接管读取点位（读取侧为覆盖语义），适配 EdgeLink 采集管线：
 
 ```javascript
 msg.tags = [
@@ -145,37 +200,32 @@ msg.tags = [
 ];
 ```
 
+运行时覆盖连接参数：
+
+```javascript
+msg.payload.plcIp = "192.168.1.20";        // 覆盖目标 IP，一节点采多台
+msg.payload.protocolParams = { unitId: 3 };// 覆盖站号
+msg.payload.timeout = 5000;                 // 覆盖超时
+```
+
 ---
 
 ## 输出格式
 
-### 正常采集
+### MC 读取
 
 ```javascript
 msg.payload = {
   success: true,
   deviceId: "PLC-1",          // 适配 edgelink-pg-store 动态分表
+  deviceName: "PLC-1",
   data: {
     "温度": {
-      rawValue: 2530,         // PLC 原始 int16
-      engValue: 253.0,        // 解码后 × 斜率 + 偏移
+      rawValue: 2530,         // 解码后的原始值（32/64 位为多字组装结果，原始首字在 rawWord）
+      engValue: 253.0,        // rawValue × 斜率 + 偏移（10 位小数舍入）
       quality: 0,             // 0=正常 2=异常
       ts: "2026-06-30T08:00:00.000Z",
-      regType: "D"            // 寄存器类型
-    },
-    "压力": {
-      rawValue: 4123,
-      engValue: 41.23,
-      quality: 0,
-      ts: "2026-06-30T08:00:00.000Z",
       regType: "D"
-    },
-    "开关": {
-      rawValue: 1,
-      engValue: 1,
-      quality: 0,
-      ts: "2026-06-30T08:00:00.000Z",
-      regType: "X"
     }
   },
   error: null,
@@ -186,30 +236,36 @@ msg.payload = {
 }
 ```
 
-### PLC 读取失败
+### MC 写入
+
+```javascript
+msg.payload = {
+  success: true,
+  deviceId: "PLC-1",
+  deviceName: "PLC-1",
+  data: {
+    "temp_set": { value: 25, quality: 0, ts: "...", regType: "D" }
+  },
+  error: null,
+  driverType: "driver-mc-write-protocol",
+  plcIp: "192.168.1.10",
+  plcPort: 5007,
+  roundTimeMs: 8
+}
+```
+
+### 失败输出（读/写同构）
 
 ```javascript
 msg.payload = {
   success: false,
   deviceId: "PLC-1",
   data: {},
-  error: "[PLC 0xC052] Address out of range",
+  error: "[PLC 0xC052] Address out of range",   // 19 个 MC 错误码可读；网络/超时/帧错误前缀区分
   driverType: "driver-mc-protocol",
   plcIp: "192.168.1.10",
   plcPort: 5007,
   roundTimeMs: 3012
-}
-```
-
-### 网络故障
-
-```javascript
-msg.payload = {
-  success: false,
-  deviceId: "PLC-1",
-  data: {},
-  error: "[NETWORK] TCP closed (no data)",
-  ...
 }
 ```
 
@@ -219,19 +275,17 @@ msg.payload = {
 
 ```
 ┌──────────┐     ┌──────────────────────────────────────┐     ┌──────────┐
-│ inject / │     │     mitsubishi-read v1.4.0            │     │ 三菱 PLC │
-│ 动态tags │────→│                                       │────→│          │
-└──────────┘     │  1. 校验 + 清洗点位（X/Y 八进制）    │     │ Q / L /  │
-                 │  2. 去重 + 聚类分组                   │     │ iQ-R /   │
-                 │  3. 长连接池 ──→ 逐组 3E/4E 帧请求   │     │ FX5U     │
-                 │  4. 解码 + 斜率变换                   │     └──────────┘
-                 │  5. 输出 {raw,eng,quality,ts}         │
+│ inject / │     │  mitsubishi-read / mitsubishi-write  │     │ 三菱 PLC │
+│ msg.tags │────→│                                      │────→│          │
+└──────────┘     │  1. 校验清洗（地址进制/值收敛）      │     │ Q / L /  │
+                 │  2. 去重 + 聚类分组（960 字/连续）   │     │ iQ-R /   │
+                 │  3. 连接池 ──→ 逐组 3E/4E 帧        │     │ iQ-F /   │
+                 │  4. 解码/回显校验 + 斜率变换         │     │ FX5U     │
+                 │  5. 输出 data[tagId]                 │     └──────────┘
                  └──────────────────────────────────────┘
-
- 连接池: CONN_POOL["host:port:frame:network:station"] → { socket, inUse, queue[] }
- 生命周期: getConnection(复用/排队/新建) → 采集 → releaseConnection(交付下个等待者)
- 空闲回收: 每 5 分钟清理 > 10 分钟未用的空闲连接
- 断线恢复: socket close/end/destroyed 检测 → destroyConnection → getConnection 重建
+ TCP: 读/写双长连接池，key 含 host:port:frame:network:station
+      请求队列串行化 · 空闲 10 分钟回收 · 断线检测重建 · 指数退避
+ UDP: 共享 dgram socket · 单在途串行化 · 迟到包丢弃 · 空闲回收
 ```
 
 ---
@@ -241,28 +295,24 @@ msg.payload = {
 | 维度 | 本节点 | mcprotocol |
 |------|--------|------------|
 | 点位数量 | **N 个 / 节点** | 1 个 / 节点 |
-| 连接模型 | 🆕 **长连接池 + 请求队列** | 短连接 (每请求新建销毁) |
-| TCP 断线恢复 | 🆕 **自动检测重建** | ⚠️ 已知 BUG (不自恢复) |
-| TCP Keepalive | 🆕 **30s 探测** | ❌ |
-| 批量优化 | **智能聚类合并** | 库内优化 (黑盒) |
-| 数据类型 | **7 种** (INT16/UINT16/INT32/UINT32/FLOAT32/FLOAT64/BOOL) | 基础类型 |
+| 连接模型 | **长连接池 + 请求队列** | 短连接（每请求新建销毁） |
+| TCP 断线恢复 | **自动检测重建** | ⚠️ 已知 BUG（不自恢复） |
+| 传输协议 | **TCP + UDP** | TCP + UDP |
+| 通信模式 | **Binary + ASCII** | Binary |
+| 数据类型 | **读 7 种 / 写 6 种** | 基础类型 |
 | 位元件 | **自动拆包 + 原生位写** | 不支持 |
-| 斜率偏移变换 | **内置** `rawValue × slope + offset` | 无 |
-| 32位/浮点 | **自动读相邻寄存器 + 拼接** | 无 |
+| 斜率偏移变换 | **内置**（含浮点尾巴舍入） | 无 |
+| 写入能力 | ✅ **字批量写 + 位原生写 + RMW + 静态默认值列** | ✅ mcprotocol-write |
+| 写安全 | ✅ **严格连续分组，绝不向间隙写 0** | ⚠️ 批量写连续覆盖 |
+| 动态 IP 覆盖 | ✅ `msg.payload.plcIp` | ❌ |
 | serialNo | **每帧自增 + 回显校验** | 固定不变 |
-| 动态 IP 覆盖 | 🆕 `msg.payload.plcIp` | ❌ |
-| deviceId 归一化 | 🆕 输出始终为数字 | ❌ |
 | 模拟模式 | ✅ `mcSimulationMode=true` | ❌ |
-| 写入能力 | ✅ **字批量写 + 位原生写 + RMW**（v1.5.1） | ✅ mcprotocol-write |
-| 写安全 | ✅ **严格连续分组，绝不向间隙写 0**（v1.5.1） | ⚠️ 批量写连续覆盖 |
-| 测试 | ✅ **91 项（规范对拍/万点压测/读写 e2e）** | ❌ 无 |
-| UDP 支持 | ✅ **UDP 会话层**（v1.4.4） | ✅ |
-| 1E 帧 / ASCII | ❌ (仅 3E/4E) | ✅ |
-| 错误诊断 | 19 个 MC 错误码可读 | 基础 |
-| 依赖 | **0** (纯 Node.js) | mcprotocol 依赖 |
-| 维护状态 | ✅ 活跃 (2026-07) | ⚠️ 停更 (2021-01) |
+| 1E 帧 | ❌（仅 3E/4E） | ✅ |
+| 测试 | ✅ **104 项（规范对拍/万点压测/读写 e2e）** | ❌ 无 |
+| 依赖 | **0**（纯 Node.js） | mcprotocol 依赖 |
+| 维护状态 | ✅ 活跃（2026-08） | ⚠️ 停更（2021-01） |
 
-> **选择建议**：需要 1E 帧/ASCII 模式/老 A 系列 PLC/T·C·SM 等全软元件家族 → mcprotocol。读写高频采集、万点级规模、要测试护栏与写安全 → 本节点。
+> **选择建议**：需要 1E 帧/老 A 系列 PLC/T·C·SM 等全软元件家族 → mcprotocol。读写高频采集、万点级规模、要测试护栏与写安全 → 本节点。
 
 ---
 
@@ -274,7 +324,7 @@ msg.payload = {
 mcSimulationMode: true
 ```
 
-重启后所有 `MC 读取` 节点不连 PLC，直接返回随机仿真数据。用于离线开发、CI 测试、Demo 演示。
+重启后 `MC 读取` 返回随机仿真数据、`MC 写入` 直接返回成功（不触碰 PLC）。用于离线开发、CI 测试、Demo 演示。
 
 ---
 
@@ -299,33 +349,42 @@ npm install
 npm test
 ```
 
-测试覆盖：
+**104 项测试**覆盖：
 
-- 3E/4E 帧构造字节级正确性
-- INT32/UINT32/FLOAT32 高低字解码
-- X/Y 八进制地址解析与格式化
-- parseMCResponse 对正常响应、MC 错误码、序列号不匹配的处理
-- 节点模拟模式与 deviceId 解析
+- 3E/4E 帧构造字节级 golden buffer 对拍（参照 pymcprotocol / SH-080008 手册）
+- 写帧 dataLen、原生位写 nibble 打包、RMW、ASCII STX/ETX/校验和编码
+- INT32/UINT32/FLOAT32/DOUBLE 多字解码与 encode↔decode 往返对称
+- X/Y 八进制地址解析（FX）与 16 进制（Q/L/iQ-R）
+- engValue 舍入边界（浮点尾巴/小值精度/大值跳过）
+- 写入合并规则（id 匹配/默认值回落/副作用安全）
+- 连接池引用计数/退避/队列超时、UDP 会话、10,000 点位 × 3 轮压测
 
 ## FAQ
 
 **Q: 连接如何管理？**  
-采用**长连接池**架构（v1.4.0）。TCP 连接建立后保持复用，跨轮采集不再重复握手。连接池 key 包含 `host:port:frame:network:station`，不同帧格式/网络号/站号的 PLC 不会复用同一条连接。同一 PLC 的多个采集节点通过**请求队列串行化**，防止并发读写交错。连接空闲 > 10 分钟自动回收，断开自动检测重建。生产环境推荐长连接池模式。
+TCP 采用**读写双长连接池**：连接建立后保持复用，池 key 含 `host:port:frame:network:station`，不同配置不复用同一条连接。同一 PLC 多节点通过**请求队列串行化**防读写交错。空闲 > 10 分钟自动回收，断开自动检测重建，失败指数退避。UDP 为无连接会话层：共享 socket、单在途串行化、ICMP 仅失败当前请求。
 
-**Q: 能同时读多个 PLC 吗？**  
-可以。每个 `PLC 连接配置` 配置一个 PLC，或在运行时通过 `msg.payload.plcIp` / `msg.payload.protocolParams` 动态覆盖。连接池按 `host:port:frame:network:station` 隔离，不同 PLC 独立管理各自的 TCP 连接。同一 PLC 多节点场景通过队列串行化保证安全。
+**Q: 能同时读写多个 PLC 吗？**  
+可以。每个 `PLC 连接配置` 配置一个 PLC，或运行时通过 `msg.payload.plcIp` / `msg.payload.protocolParams` 动态覆盖。
 
 **Q: 点位地址能写成 "D100" 格式吗？**  
-可以。地址字段兼容 `"D100"` 格式（自动提取数字部分），也支持纯数字 `100`。  
-> **注意**：`X` / `Y` 为三菱八进制地址，输入 `X10` 表示物理点 `X10`（八进制），内部会自动转换为十进制处理，输出 ID 也保持八进制显示。`M` / `L` / `B` 仍为十进制。
+可以。地址字段兼容 `"D100"` 格式（自动提取数字部分），也支持纯数字 `100`。
+> **注意**：`X` / `Y` 仅在 **FX 系列**下为 8 进制地址（`X10` 是八进制物理点），Q/L/iQ-R 均为 16 进制。config 的"PLC 系列"字段决定解释规则。
 
-**Q: switch 元素一次最多读多少个点位？**  
-字元件单次最多 960 字，位元件单次最多 15360 点。超出自动拆组，无需手动干预。
+**Q: 一次最多读/写多少点？**  
+读取：字元件单次最多 960 字、位元件单次最多 15360 点，超出自动拆组。写入按严格连续分组拆帧，间隙地址绝不补 0。
 
 **Q: 支持 FX3U 吗？**  
 带以太网模块（FX3U-ENET）支持 3E 帧。不带以太网模块的 FX3U 不支持（需要 1E 帧或串口）。
 
+**Q: 只开了 ASCII 口的老 PLC 能用吗？**  
+可以。config 的"通信模式"选 ASCII，帧按 Hex 编码 + STX/ETX/校验和传输（v1.5.1 起，3E/4E 均支持）。
+
 ---
+
+## 更新日志
+
+详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

@@ -314,6 +314,22 @@ describe('mc-protocol', function () {
     it('null input → null', function () {
       assert.strictEqual(mc.applyTransform(null, {}), null);
     });
+    it('v1.6.0: kills float arithmetic tail (27862 * 0.1 → 2786.2)', function () {
+      assert.strictEqual(mc.applyTransform(27862, { slope: 0.1 }), 2786.2);
+    });
+    it('v1.6.0: keeps small-value precision (not wiped like toFixed(4))', function () {
+      assert.strictEqual(mc.applyTransform(0.00006, {}), 0.00006);
+    });
+    it('v1.6.0: large values skip rounding (INT32 range, no 2^53 artifact)', function () {
+      assert.strictEqual(mc.applyTransform(2100000000, {}), 2100000000);
+      assert.strictEqual(mc.applyTransform(-2100000000, { slope: 1 }), -2100000000);
+    });
+    it('v1.6.0: roundEng passthrough rules', function () {
+      assert.strictEqual(mc.roundEng(null), null);
+      assert.strictEqual(mc.roundEng(undefined), undefined);
+      assert.strictEqual(mc.roundEng(0.1 + 0.2), 0.3);
+      assert.strictEqual(mc.roundEng(1e6), 1e6);
+    });
   });
 
   // ===== v1.5.0: 写入函数测试 =====

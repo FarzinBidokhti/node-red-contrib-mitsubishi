@@ -17,6 +17,22 @@ module.exports = function (RED) {
   var mc = require('./mc-protocol');
   var mcUdp = require('./mc-udp');
 
+  // 🔧 v1.6.0: 面板默认值列是字符串，统一按类型收敛。
+  // BOOL 用词表（true/1/on），避免字符串 "false"/"0" 被 truthy 误判为写 1；
+  // 数字 Number() 转换，非法值返回 null —— 拒写而不是静默写 0（写操作有副作用）
+  function coerceWriteValue(v, dt) {
+    if (dt === 'BOOL') {
+      return (v === true || v === 1 || v === '1' || v === 'true' || v === 'on') ? 1 : 0;
+    }
+    if (typeof v === 'string') {
+      var n = Number(v.trim());
+      return isNaN(n) ? null : n;
+    }
+    if (typeof v === 'number') return isNaN(v) ? null : v;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    return null;
+  }
+
   // ===== 写入连接池（独立于读取池，写操作零星稀疏避免排队）=====
   var CONN_POOL_W = {};
   var IN_FLIGHT_W = {};
@@ -277,12 +293,38 @@ module.exports = function (RED) {
         }
       }
 
-      var rawTags = msg.tags || incoming.tags;
-      if (!rawTags || (Array.isArray(rawTags) && rawTags.length === 0)) {
-        rawTags = configTags;
+      // 🔧 v1.6.0: 面板表格与 msg.tags 合并（此前 msg.tags 全量覆盖面板）。规则：
+      //   - 无 msg.tags：整轮用面板表格（v1.6.0 默认值列生效，纯静态写入走通）
+      //   - 有 msg.tags：msg 驱动本轮；每条 msg 点位按 id（其次 regType+addr）匹配面板行
+      //     补齐缺失字段（value 缺省回落面板默认值）；未被 msg 引用的面板行本轮【不】执行
+      //     （防静态默认值随动态轮次被误写——写操作有副作用）
+      var msgTags = msg.tags || incoming.tags;
+      var tags;
+      if (!msgTags || (Array.isArray(msgTags) && msgTags.length === 0)) {
+        tags = configTags.slice();
+      } else {
+        if (!Array.isArray(msgTags)) msgTags = [msgTags];
+        var cfgById = {}, cfgByAddr = {};
+        configTags.forEach(function (ct) {
+          if (ct.id !== undefined && ct.id !== null && ct.id !== '') cfgById[String(ct.id)] = ct;
+          var ca = (ct.addr !== undefined && ct.addr !== null && ct.addr !== '') ? ct.addr : ct.regAddr;
+          if (ca !== undefined && ca !== null && ca !== '') cfgByAddr[(ct.regType || 'D') + '|' + String(ca)] = ct;
+        });
+        tags = msgTags.map(function (mt) {
+          var cfg = null;
+          if (mt.id !== undefined && mt.id !== null && mt.id !== '') cfg = cfgById[String(mt.id)] || null;
+          if (!cfg) {
+            var ma = (mt.addr !== undefined && mt.addr !== null && mt.addr !== '') ? mt.addr : mt.regAddr;
+            if (ma !== undefined && ma !== null && ma !== '') cfg = cfgByAddr[(mt.regType || 'D') + '|' + String(ma)] || null;
+          }
+          if (!cfg) return mt;
+          // 面板兜底，msg 字段优先（undefined/null 不覆盖）
+          var merged = {};
+          for (var ck in cfg) { if (cfg.hasOwnProperty(ck)) merged[ck] = cfg[ck]; }
+          for (var mk in mt) { if (mt.hasOwnProperty(mk) && mt[mk] !== undefined && mt[mk] !== null) merged[mk] = mt[mk]; }
+          return merged;
+        });
       }
-      if (!Array.isArray(rawTags)) rawTags = [rawTags];
-      var tags = rawTags;
 
       var allValidTags = [];
       for (var i = 0; i < tags.length; i++) {
@@ -300,7 +342,8 @@ module.exports = function (RED) {
           node.warn('[MC-WRITE] Invalid addr for tag ' + (t.id || t.name || ('#' + i)));
           continue;
         }
-        if (t.value === undefined || t.value === null) {
+        // 🔧 v1.6.0: 空串同样视为缺省值（面板默认值列留空 ≠ 写入空串）
+        if (t.value === undefined || t.value === null || t.value === '') {
           node.warn('[MC-WRITE] Missing value for tag ' + (t.id || t.name || (rt + addr)));
           continue;
         }
@@ -315,10 +358,13 @@ module.exports = function (RED) {
           return bv;
         })();
         // 值校验与钳制
-        var writeVal = t.value;
-        if (dt === 'BOOL') {
-          writeVal = writeVal ? 1 : 0;
-        } else if (dt === 'UINT16' && writeVal > 65535) {
+        // 🔧 v1.6.0: 面板默认值列是字符串，统一按类型收敛；非法值拒写而不是静默写 0
+        var writeVal = coerceWriteValue(t.value, dt);
+        if (writeVal === null) {
+          node.warn('[MC-WRITE] Invalid value for tag ' + (t.id || t.name || (rt + addr)) + ': ' + t.value);
+          continue;
+        }
+        if (dt === 'UINT16' && writeVal > 65535) {
           node.warn('[MC-WRITE] UINT16 overflow for ' + tagId + ', clamped to 65535');
           writeVal = 65535;
         } else if (dt === 'INT16' && writeVal > 32767) {

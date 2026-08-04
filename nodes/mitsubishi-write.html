@@ -46,13 +46,13 @@
 
   <!-- CSV 导入区 -->
   <div id="w-csv-import-area" style="display:none;margin-bottom:6px">
-    <textarea id="w-csv-import-text" style="width:100%;height:60px;font-size:11px;box-sizing:border-box" placeholder="regType,addr,dataType,byteOrder,wordOrder,bitOffset,name,id
-D,100,INT16,,,src,温度设定点,temp_set
-M,0,BOOL,,,,,启动信号,m_start"></textarea>
+    <textarea id="w-csv-import-text" style="width:100%;height:60px;font-size:11px;box-sizing:border-box" placeholder="regType,addr,dataType,byteOrder,wordOrder,bitOffset,name,id,value
+D,100,INT16,,,src,温度设定点,temp_set,25.0
+M,0,BOOL,,,,,启动信号,m_start,"></textarea>
     <button class="red-ui-button" onclick="writeTagEditor.doImportCSV()" style="font-size:11px;padding:2px 8px;margin-top:2px">
       <i class="fa fa-check"></i> 确认导入
     </button>
-    <span style="font-size:10px;color:#888;margin-left:4px">首行为列名，从第二行起每行一个点位。写入值由 msg.payload.tags[].value 提供</span>
+    <span style="font-size:10px;color:#888;margin-left:4px">首行为列名，从第二行起每行一个点位。写入值：msg.payload.tags[].value 优先，缺省回落默认值列</span>
   </div>
 
   <!-- 分页 + 批量删除 -->
@@ -74,7 +74,7 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
 
   <!-- 点位编辑表格 -->
   <div class="form-row" style="margin-top:0">
-    <label><i class="fa fa-list"></i> 点位表格 (msg.payload.tags 传入时覆盖；value 由 msg 提供)</label>
+    <label><i class="fa fa-list"></i> 点位表格 (msg.payload.tags 传入时按 id/地址合并；value 缺省回落默认值)</label>
   </div>
   <div style="margin-bottom:4px;max-height:420px;overflow-y:auto">
     <table style="width:100%;font-size:11px;border-collapse:collapse">
@@ -90,6 +90,7 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
           <th style="width:12%;text-align:left">名称</th>
           <th style="width:5%"></th>
           <th style="width:10%;text-align:left">ID</th>
+          <th style="width:9%;text-align:left" title="静态默认值：msg 未提供 value 时使用；留空则必须由 msg 提供">默认值</th>
         </tr>
       </thead>
       <tbody id="w-tags-tbody"></tbody>
@@ -102,8 +103,8 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
 
   <hr>
   <div style="color:#888;font-size:11px;margin-bottom:4px">
-    <i class="fa fa-info-circle"></i> 静态: 表格配置点位定义 | 动态: msg.payload.tags 传入覆盖<br>
-    写入值由 msg.payload.tags[].value 提供（运行时动态赋值，表格不配默认值）<br>
+    <i class="fa fa-info-circle"></i> 静态: 表格配置点位定义+默认值，任意消息触发即写入 | 动态: msg.payload.tags 按 id/地址合并覆盖<br>
+    写入值：msg.payload.tags[].value 优先，缺省回落表格默认值列；两者都无则跳过该点位<br>
     输出: msg.payload.data[点位ID] = {value, quality, ts, regType}<br>
     BOOL / 位设备地址自动走 RMW（读-改-写），非 BOOL 字元件直接批量写
   </div>
@@ -125,7 +126,7 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
     },
 
     add: function () {
-      this.rows.push({ id: '', regType: 'D', addr: '', dataType: 'INT16', byteOrder: '', wordOrder: '', bitOffset: '', name: '' });
+      this.rows.push({ id: '', regType: 'D', addr: '', dataType: 'INT16', byteOrder: '', wordOrder: '', bitOffset: '', name: '', value: '' });
       this.render();
       this.save();
     },
@@ -193,7 +194,7 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
           id: row.id || '', regType: row.regType || 'D',
           addr: row.addr || '', dataType: row.dataType || 'INT16',
           byteOrder: row.byteOrder || '', wordOrder: row.wordOrder || '', bitOffset: row.bitOffset || '',
-          name: row.name || ''
+          name: row.name || '', value: row.value || ''
         });
         added++;
       }
@@ -206,10 +207,10 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
     },
 
     exportCSV: function () {
-      var csv = 'regType,addr,dataType,byteOrder,wordOrder,bitOffset,name,id\n';
+      var csv = 'regType,addr,dataType,byteOrder,wordOrder,bitOffset,name,id,value\n';
       for (var i = 0; i < this.rows.length; i++) {
         var r = this.rows[i];
-        csv += [r.regType||'', r.addr||'', r.dataType||'', r.byteOrder||'', r.wordOrder||'', r.bitOffset||'', r.name||'', r.id||''].join(',') + '\n';
+        csv += [r.regType||'', r.addr||'', r.dataType||'', r.byteOrder||'', r.wordOrder||'', r.bitOffset||'', r.name||'', r.id||'', r.value||''].join(',') + '\n';
       }
       var blob = new Blob(['﻿' + csv], {type: 'text/csv;charset=utf-8'});
       var url = URL.createObjectURL(blob);
@@ -280,6 +281,11 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
         id.on('change', function () { self.update(idx, 'id', $(this).val()); });
         tr.append($('<td>').append(id));
 
+        var val = mkInp(row.value, '静态值', 'text', '85%');
+        val.title = '静态默认值：msg 未提供 value 时使用';
+        val.on('change', function () { self.update(idx, 'value', $(this).val()); });
+        tr.append($('<td>').append(val));
+
         tbody.append(tr);
       });
     }
@@ -310,7 +316,7 @@ M,0,BOOL,,,,,启动信号,m_start"></textarea>
           writeTagEditor.rows.push({
             id: '', regType: reg, addr: String(start + i),
             dataType: dt, name: reg + (start + i),
-            byteOrder: '', wordOrder: '', bitOffset: ''
+            byteOrder: '', wordOrder: '', bitOffset: '', value: ''
           });
         }
         writeTagEditor.render();

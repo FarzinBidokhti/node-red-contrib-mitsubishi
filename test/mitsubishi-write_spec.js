@@ -500,4 +500,109 @@ describe('mitsubishi-write node', function () {
       });
     });
   });
+
+  describe('v1.6.0: value column & merge', function () {
+    // 模拟模式开关泄漏会污染后续 spec 文件（helper settings 是进程级全局）
+    afterEach(function () { helper.settings({}); });
+
+  it('v1.6.0: static write from panel value column (no msg.tags)', function (done) {
+    helper.settings({ mcSimulationMode: true });
+
+    var flow = [
+      { id: 'ncv1', type: 'mitsubishi-config', name: 'PLC-1', host: '192.168.1.10', port: 5007, frame: '3E' },
+      {
+        id: 'nwv1', type: 'mitsubishi-write', name: 'MC Write', plc: 'ncv1',
+        tags: JSON.stringify([
+          { id: 'setpoint', regType: 'D', addr: '100', dataType: 'INT16', value: '25' },
+          { id: 'noval', regType: 'D', addr: '101', dataType: 'INT16', value: '' },
+          { id: 'badval', regType: 'D', addr: '102', dataType: 'INT16', value: 'abc' }
+        ]),
+        wires: [['nhv1']]
+      },
+      { id: 'nhv1', type: 'helper' }
+    ];
+
+    helper.load([mcConfigNode, mcWriteNode], flow, function () {
+      var h = helper.getNode('nhv1');
+      h.on('input', function (msg) {
+        try {
+          assert.strictEqual(msg.payload.success, true);
+          // 面板默认值列（字符串 "25"）被收敛为数字 25 写入
+          assert.strictEqual(msg.payload.data['setpoint'].value, 25);
+          // 无默认值 / 非法值的行被跳过（拒写而不是静默写 0）
+          assert.strictEqual(msg.payload.data['noval'], undefined);
+          assert.strictEqual(msg.payload.data['badval'], undefined);
+          done();
+        } catch (e) { done(e); }
+      });
+      helper.getNode('nwv1').receive({ payload: { id: 100 } });
+    });
+  });
+
+  it('v1.6.0: msg.tags merges with panel row by id (override & value fallback)', function (done) {
+    helper.settings({ mcSimulationMode: true });
+
+    var flow = [
+      { id: 'ncv2', type: 'mitsubishi-config', name: 'PLC-1', host: '192.168.1.10', port: 5007, frame: '3E' },
+      {
+        id: 'nwv2', type: 'mitsubishi-write', name: 'MC Write', plc: 'ncv2',
+        tags: JSON.stringify([
+          { id: 'sp1', regType: 'D', addr: '100', dataType: 'INT16', value: '10' },
+          { id: 'sp2', regType: 'D', addr: '200', dataType: 'INT16', value: '20' }
+        ]),
+        wires: [['nhv2']]
+      },
+      { id: 'nhv2', type: 'helper' }
+    ];
+
+    helper.load([mcConfigNode, mcWriteNode], flow, function () {
+      var h = helper.getNode('nhv2');
+      h.on('input', function (msg) {
+        try {
+          assert.strictEqual(msg.payload.success, true);
+          assert.strictEqual(msg.payload.data['sp1'].value, 99);   // msg.value 覆盖面板默认值
+          assert.strictEqual(msg.payload.data['sp2'].value, 20);   // msg 未给 value → 回落面板默认
+          done();
+        } catch (e) { done(e); }
+      });
+      helper.getNode('nwv2').receive({
+        payload: { id: 100 },
+        tags: [{ id: 'sp1', value: 99 }, { id: 'sp2' }]
+      });
+    });
+  });
+
+  it('v1.6.0: msg-driven round skips unreferenced panel rows (side-effect safety)', function (done) {
+    helper.settings({ mcSimulationMode: true });
+
+    var flow = [
+      { id: 'ncv3', type: 'mitsubishi-config', name: 'PLC-1', host: '192.168.1.10', port: 5007, frame: '3E' },
+      {
+        id: 'nwv3', type: 'mitsubishi-write', name: 'MC Write', plc: 'ncv3',
+        tags: JSON.stringify([
+          { id: 'sp3', regType: 'D', addr: '300', dataType: 'INT16', value: '777' }
+        ]),
+        wires: [['nhv3']]
+      },
+      { id: 'nhv3', type: 'helper' }
+    ];
+
+    helper.load([mcConfigNode, mcWriteNode], flow, function () {
+      var h = helper.getNode('nhv3');
+      h.on('input', function (msg) {
+        try {
+          assert.strictEqual(msg.payload.success, true);
+          assert.strictEqual(msg.payload.data['other'].value, 1);
+          // 面板带默认值的行未被 msg 引用 → 本轮不执行（防静态值随动态轮次误写）
+          assert.strictEqual(msg.payload.data['sp3'], undefined);
+          done();
+        } catch (e) { done(e); }
+      });
+      helper.getNode('nwv3').receive({
+        payload: { id: 100 },
+        tags: [{ id: 'other', regType: 'D', addr: 400, dataType: 'INT16', value: 1 }]
+      });
+    });
+  });
+  });
 });

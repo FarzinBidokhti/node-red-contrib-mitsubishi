@@ -613,6 +613,18 @@ function decodeTag(raw, regType, addr, dataType, byteOrder, wordOrder, bitOffset
   return { value: originRv, quality: 0, rawWord: originRv };
 }
 
+// ===== v1.6.0: 工程值舍入 =====
+// 10 位小数舍入消除浮点算术尾巴（27862*0.1=2786.2000000000003 → 2786.2），
+// 同时保留小值精度（0.00006 不会像 review#3 前的 toFixed(4) 那样被抹成 0.0001）。
+// |v|≥9e5 时 v*1e10 逼近 2^53，舍入反而引入误差，直接返回（大整数本身无尾巴）。
+// 注：FLOAT32 解码源的值本身只有 ~7 位有效数字（PLC 存 2786.2 实为 2786.199951…），
+// 此处按 10 位小数保留其精确值，显示层格式化另行处理。
+function roundEng(v) {
+  if (v === null || v === undefined) return v;
+  if (Math.abs(v) >= 9e5) return v;
+  return Math.round(v * 1e10) / 1e10;
+}
+
 // ===== 斜率偏移变换 =====
 function applyTransform(rawValue, tagDef) {
   if (rawValue === null || rawValue === undefined) return null;
@@ -623,8 +635,8 @@ function applyTransform(rawValue, tagDef) {
   var offset = parseFloat((offsetRaw === undefined || offsetRaw === null) ? 0 : offsetRaw);
   if (isNaN(slope)) slope = 1;
   if (isNaN(offset)) offset = 0;
-  // 🔧 review#3: 不再 toFixed(4) 截断工程值，保留完整精度（下游 PG numeric 可承载）
-  return rawValue * slope + offset;
+  // 🔧 v1.6.0: 10 位小数舍入（与 review#3 "不去尾" 的和解方案：小值保得住，尾巴也没有）
+  return roundEng(rawValue * slope + offset);
 }
 
 module.exports = {
@@ -660,5 +672,6 @@ module.exports = {
   parseMCResponse: parseMCResponse,
   parseMCWriteResponse: parseMCWriteResponse,
   buildRMWWriteGroup: buildRMWWriteGroup,
+  roundEng: roundEng,
   applyTransform: applyTransform
 };
