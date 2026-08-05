@@ -1,3 +1,10 @@
+## v1.6.3 (2026-08-05)
+- **FIX: SLMP ASCII Code 以太网通信（重要）** — 旧版 `asciify`/`deasciify` 实现的是串口 ASCII 格式（STX+hex+ETX+checksum），无法与以太网 ASCII Code 的 PLC 通信。新增 `toAsciiHex`/`fromAsciiHex`/`dehexifyFrame`（纯 hex 编解码，无帧头帧尾），read/write 节点 TCP 路径全面切换
+- **FIX: write 节点 ASCII 接收路径补齐** — 位写、字写、RMW 读、RMW 写四个 TCP `_dataHandler` 均已补 hex 解码
+- **FIX: UDP+ASCII 假阳性** — 选 UDP+ASCII 时降级为 Binary 并打 warn，避免用户误以为 UDP 支持 ASCII Code
+- **FIX: bitOffset 空字符串误报警告** — 点位配置中含 `bitOffset: ""` 时不再打印 `Invalid bitOffset` 警告
+- **TEST: +12 项 SLMP ASCII** — 往返、3E/4E 帧提取、错误路径、垃圾前缀、尾数据、与 asciify 一致性；write 端到端 ASCII 测试更新
+
 ## v1.6.0 (2026-08-02)
 - **FIX: engValue 浮点算术尾巴** — `applyTransform` 统一 10 位小数舍入（新增 `roundEng`）：27862×0.1 输出 2786.2 而非 2786.2000000000003；小值精度保留（0.00006 不会像旧 toFixed(4) 那样被抹成 0.0001）；|v|≥9e5 大值跳过舍入（v*1e10 逼近 2^53，舍入反而引入误差）。计算点位 rawValue 同步处理。注：FLOAT32 解码源本身只有 ~7 位有效数字，显示层格式化另行处理
 - **FEAT: 写入表格新增默认值列（value）** — 面板可配静态默认值，任意消息触发即整表写入，临时写固定值调试不再依赖 function 节点；CSV 导入导出同步

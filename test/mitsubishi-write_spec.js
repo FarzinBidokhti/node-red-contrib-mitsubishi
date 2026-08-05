@@ -384,26 +384,23 @@ describe('mitsubishi-write node', function () {
     });
   });
 
-  // ===== v1.5.1: ASCII 模式端到端测试 =====
-  it('ASCII mode: word write via STX/ETX/checksum encoding', function (done) {
+  // ===== v1.6.0: SLMP ASCII Code 端到端测试（hex 编码，无 STX/ETX/checksum）=====
+  it('ASCII mode: word write via SLMP hex encoding', function (done) {
     helper.settings({});
     var net = require('net');
-    var PORT = 17518;
+    var PORT = 17519;
 
     var server = net.createServer(function (socket) {
       var buf = Buffer.alloc(0);
       socket.on('data', function (chunk) {
         buf = Buffer.concat([buf, chunk]);
-        // ASCII 帧: STX + hex(2*21=42) + ETX + 2checksum = 46 bytes
-        if (buf.length >= 46) {
-          // 校验 STX
-          assert.strictEqual(buf[0], 0x02, 'STX');
-          // 校验 ETX 位置
-          var etxIdx = buf.indexOf(0x03);
-          assert.ok(etxIdx > 0, 'ETX present in ASCII frame');
-          // 回复 ASCII 写响应
+        // SLMP ASCII: 21 字节 = 42 hex chars（无帧头帧尾）
+        if (buf.length >= 42) {
+          // 校验前两个 hex 字元 = "50"（3E 子标题）
+          assert.strictEqual(buf.toString('ascii', 0, 2), '50', 'hex frame starts with 50');
+          // 回复 SLMP ASCII 写响应
           var binResp = Buffer.from([0xD0, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00]);
-          var asciiResp = require('../nodes/mc-protocol').asciify(binResp);
+          var asciiResp = require('../nodes/mc-protocol').toAsciiHex(binResp);
           socket.write(asciiResp);
           buf = Buffer.alloc(0);
         }

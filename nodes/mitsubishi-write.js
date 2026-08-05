@@ -553,7 +553,9 @@ module.exports = function (RED) {
       }
 
       // ===== UDP 路径 =====
+      // ⚠ ASCII Code 在 UDP 路径未实现，选 UDP+ASCII 时降级为 Binary
       if (plc.protocol === 'udp') {
+        if (plc.ascii) node.warn('[MC-WRITE] UDP+ASCII 组合未支持，降级为 UDP+Binary；如需 ASCII 请改用 TCP');
         mcUdp.acquire(node, connKey, plc.timeout, function (aerr, udpEntry) {
           if (aerr) {
             msg.payload = {
@@ -891,7 +893,7 @@ module.exports = function (RED) {
             mcSocket.setTimeout(timeout);
             try {
               var frame = mc.buildBitWriteFrame(frameType, enc.startAddr, enc.bitCount, enc.data, stationNo, bitGrp.regType, networkNo, sentSN);
-              var wireBit = plc.ascii ? mc.asciify(frame) : frame;
+              var wireBit = plc.ascii ? mc.toAsciiHex(frame) : frame;
               mcSocket.write(wireBit);
             } catch (e) {
               node.warn('[MC-WRITE] bit frame build error: ' + e.message);
@@ -909,6 +911,30 @@ module.exports = function (RED) {
             _dataHandler = function (sock) {
               return function (chunk) {
                 try {
+                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
+                  if (plc.ascii) {
+                    if (buf.length + chunk.length > 65536) { resolved = true; cleanupListeners(sock); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
+                    buf = Buffer.concat([buf, chunk]);
+                    var _bhdr = (frameType === '4E') ? 15 : 11;
+                    var _boff = (frameType === '4E') ? 11 : 7;
+                    var bdf = mc.dehexifyFrame(buf, _bhdr, _boff);
+                    if (bdf.err) { buf = buf.slice(bdf.consumed); node.warn('[MC-WRITE] ASCII bit frame err: ' + bdf.err); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
+                    if (!bdf.result) return;
+                    resolved = true; cleanupListeners(sock);
+                    var resp = mc.parseMCWriteResponse(bdf.result, frameType, sentSN);
+                    if (resp && resp.mcError) {
+                      hasFailed = true;
+                      if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
+                      sorted.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                    } else if (resp && resp.ok) {
+                      var groupTs = new Date().toISOString();
+                      sorted.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
+                    } else {
+                      setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval);
+                    }
+                    setTimeout(function () { processPhase(pi + 1); }, 0);
+                    return;
+                  }
                   if (buf.length + chunk.length > 65536) { resolved = true; cleanupListeners(sock); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
                   buf = Buffer.concat([buf, chunk]);
                   var hdrLen = (frameType === '4E') ? 15 : 11;
@@ -1007,7 +1033,6 @@ module.exports = function (RED) {
             if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
 
             var buf = Buffer.alloc(0);
-            var asciiBufW = Buffer.alloc(0);  // 🔧 v1.5.1: ASCII 模式累加缓冲
             var resolved = false;
             var _tmoHandler = null, _errHandler = null, _dataHandler = null;
             var _reqTimer = null;
@@ -1024,7 +1049,7 @@ module.exports = function (RED) {
 
             try {
               var frame = mc.buildWriteFrame(frameType, startA, words, stationNo, grp.regType, networkNo, sentSN);
-              var wireFrameW = plc.ascii ? mc.asciify(frame) : frame;
+              var wireFrameW = plc.ascii ? mc.toAsciiHex(frame) : frame;
               mcSocket.write(wireFrameW);
             } catch (e) {
               node.warn('[MC-WRITE] write error: ' + e.message);
@@ -1043,15 +1068,39 @@ module.exports = function (RED) {
             _dataHandler = function (sock) {
               return function (chunk) {
                 try {
-                  // 🔧 v1.5.1: ASCII deasciify shim — 将 ASCII chunk 转为 binary chunk，其余逻辑不变
+                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
                   if (plc.ascii) {
-                    asciiBufW = Buffer.concat([asciiBufW, chunk]);
-                    while (true) {
-                      var da = mc.deasciify(asciiBufW); asciiBufW = asciiBufW.slice(da.consumed);
-                      if (da.err) { node.warn('[MC-WRITE] ASCII decode: ' + da.err); continue; }
-                      if (!da.result) return;
-                      chunk = da.result; break;
+                    if (buf.length + chunk.length > 65536) {
+                      resolved = true; cleanupListeners(sock);
+                      node.warn('[MC-WRITE] ASCII buffer overflow');
+                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
+                      return;
                     }
+                    buf = Buffer.concat([buf, chunk]);
+                    var _hdrLen = (frameType === '4E') ? 15 : 11;
+                    var _lenOff = (frameType === '4E') ? 11 : 7;
+                    var df = mc.dehexifyFrame(buf, _hdrLen, _lenOff);
+                    if (df.err) {
+                      buf = buf.slice(df.consumed);
+                      node.warn('[MC-WRITE] ASCII frame error: ' + df.err);
+                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
+                      return;
+                    }
+                    if (!df.result) return;
+                    resolved = true; cleanupListeners(sock);
+                    var resp = mc.parseMCWriteResponse(df.result, frameType, sentSN);
+                    if (resp && resp.mcError) {
+                      hasFailed = true;
+                      if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
+                      grp.tags.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                    } else if (resp && resp.ok) {
+                      var groupTs = new Date().toISOString();
+                      grp.tags.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
+                    } else {
+                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
+                    }
+                    setTimeout(function () { processPhase(pi + 1); }, 0);
+                    return;
                   }
                   if (buf.length + chunk.length > 65536) {
                     resolved = true;
@@ -1208,7 +1257,7 @@ module.exports = function (RED) {
             mcSocket.setTimeout(timeout);
 
             try {
-              var wireRMW = plc.ascii ? mc.asciify(readFrame) : readFrame;
+              var wireRMW = plc.ascii ? mc.toAsciiHex(readFrame) : readFrame;
               mcSocket.write(wireRMW);
             } catch (e) {
               node.warn('[MC-WRITE] RMW read write error: ' + e.message);
@@ -1233,42 +1282,53 @@ module.exports = function (RED) {
                     return;
                   }
                   rdBuf = Buffer.concat([rdBuf, chunk]);
-                  var hdrLen = (frameType === '4E') ? 15 : 11;
-                  if (!rdResolved && rdBuf.length >= hdrLen) {
-                    var dataLen = rdBuf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
+                  var rHdrLen = (frameType === '4E') ? 15 : 11;
+                  var rLenOff = (frameType === '4E') ? 11 : 7;
+                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
+                  if (plc.ascii) {
+                    var rmwDf = mc.dehexifyFrame(rdBuf, rHdrLen, rLenOff);
+                    if (rmwDf.err) { rdBuf = rdBuf.slice(rmwDf.consumed); node.warn('[MC-WRITE] RMW read ASCII frame err: ' + rmwDf.err); setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval); return; }
+                    if (!rmwDf.result) return;
+                    rdBuf = Buffer.concat([rmwDf.result, rdBuf.slice(rmwDf.consumed)]);
+                    rdResolved = true; rdCleanup(sock);
+                  } else {
+                    // Binary: frame boundary detection
+                    if (rdBuf.length < rHdrLen) return;           // need more data
+                    if (rdResolved) return;
+                    var dataLen = rdBuf.readUInt16LE(rLenOff) - 2;
                     if (dataLen < 0 || dataLen > 2000) {
                       rdResolved = true; rdCleanup(sock);
                       setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
                       return;
                     }
-                    if (rdBuf.length >= hdrLen + dataLen) {
-                      rdResolved = true;
-                      rdCleanup(sock);
-                      var raw = mc.parseMCResponse(rdBuf, rmwGrp.wordAddr, rmwGrp.regType, frameType, sentSN);
-                      if (!raw || raw.err || raw.mcError) {
-                        setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                        return;
-                      }
-                      // 🔧 RMW: 位设备 parseMCResponse 返回每 bit 值而非 word 值，
-                      // 直接读 buf 中的 raw word
-                      var ds2 = (frameType === '4E') ? 15 : 11;
-                      if (rdBuf.length < ds2 + 2) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[RMW-READ] buffer too short for ' + rmwGrp.regType + rmwGrp.wordAddr;
-                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                        return;
-                      }
-                      var wordVal = rdBuf.readUInt16LE(ds2);
-                      if (wordVal === undefined || wordVal === null) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[RMW-READ] no data for ' + rmwGrp.regType + rmwGrp.wordAddr;
-                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                        return;
-                      }
-                      // Step 2: 修改位
-                      var modified = wordVal & 0xFFFF;
+                    if (rdBuf.length < rHdrLen + dataLen) return; // incomplete frame
+                    rdResolved = true; rdCleanup(sock);
+                  }
+                  if (rdBuf.length >= rHdrLen) {
+                    var raw = mc.parseMCResponse(rdBuf, rmwGrp.wordAddr, rmwGrp.regType, frameType, sentSN);
+                    if (!raw || raw.err || raw.mcError) {
+                      setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
+                      return;
+                    }
+                    // 直接读 buf 中的 raw word（处理完 hex 解码的 ASCII 路径也一样）
+                    var ds2 = (frameType === '4E') ? 15 : 11;
+                    if (rdBuf.length < ds2 + 2) {
+                      hasFailed = true;
+                      if (!firstError) firstError = '[RMW-READ] buffer too short for ' + rmwGrp.regType + rmwGrp.wordAddr;
+                      rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                      setTimeout(function () { processPhase(pi + 1); }, 0);
+                      return;
+                    }
+                    var wordVal = rdBuf.readUInt16LE(ds2);
+                    if (wordVal === undefined || wordVal === null) {
+                      hasFailed = true;
+                      if (!firstError) firstError = '[RMW-READ] no data for ' + rmwGrp.regType + rmwGrp.wordAddr;
+                      rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                      setTimeout(function () { processPhase(pi + 1); }, 0);
+                      return;
+                    }
+                    // Step 2: 修改位
+                    var modified = wordVal & 0xFFFF;
                       rmwGrp.bits.forEach(function (b) {
                         if (b.value) modified |= (1 << b.bitOffset);
                         else modified &= ~(1 << b.bitOffset);
@@ -1276,7 +1336,6 @@ module.exports = function (RED) {
                       // Step 3: 写回
                       rmwWriteBack(modified);
                     }
-                  }
                 } catch (e) {
                   node.warn('[MC-WRITE] RMW read handler error: ' + e.message);
                   rdCleanup(sock); rdResolved = true;
@@ -1378,7 +1437,7 @@ module.exports = function (RED) {
               mcSocket.setTimeout(timeout);
 
               try {
-                var wireRMW2 = plc.ascii ? mc.asciify(writeFrame) : writeFrame;
+                var wireRMW2 = plc.ascii ? mc.toAsciiHex(writeFrame) : writeFrame;
                 mcSocket.write(wireRMW2);
               } catch (e) {
                 node.warn('[MC-WRITE] RMW write error: ' + e.message);
@@ -1396,6 +1455,31 @@ module.exports = function (RED) {
               wrData = function (sock) {
                 return function (chunk) {
                   try {
+                    // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
+                    if (plc.ascii) {
+                      if (wrBuf.length + chunk.length > 65536) { wrResolved = true; wrCleanup(sock); setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval); return; }
+                      wrBuf = Buffer.concat([wrBuf, chunk]);
+                      var _whdr = (frameType === '4E') ? 15 : 11;
+                      var _woff = (frameType === '4E') ? 11 : 7;
+                      var wdf = mc.dehexifyFrame(wrBuf, _whdr, _woff);
+                      if (wdf.err) { wrBuf = wrBuf.slice(wdf.consumed); node.warn('[MC-WRITE] RMW write ASCII frame err: ' + wdf.err); setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval); return; }
+                      if (!wdf.result) return;
+                      wrResolved = true; wrCleanup(sock);
+                      var wresp = mc.parseMCWriteResponse(wdf.result, frameType, wsSN);
+                      if (wresp && wresp.ok) {
+                        var groupTs = new Date().toISOString();
+                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: b.value, quality: 0, ts: groupTs }; });
+                        setTimeout(function () { processPhase(pi + 1); }, 0);
+                      } else if (wresp && wresp.mcError) {
+                        hasFailed = true;
+                        if (!firstError) firstError = '[PLC 0x' + wresp.mcError.toString(16).toUpperCase() + '] ' + wresp.mcErrorText;
+                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                        setTimeout(function () { processPhase(pi + 1); }, 0);
+                      } else {
+                        setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
+                      }
+                      return;
+                    }
                     if (wrBuf.length + chunk.length > 65536) {
                       wrResolved = true; wrCleanup(sock);
                       setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);

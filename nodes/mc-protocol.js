@@ -324,10 +324,11 @@ function buildBitWriteFrame(frameType, startAddr, bitCount, data, stationNo, reg
     : build3EBitWriteFrame(startAddr, bitCount, data, stationNo, regType, networkNo);
 }
 
-// ===== v1.5.1: ASCII 通信模式（二进制帧 → hex + STX/ETX/checksum）=====
-// 部分老旧现场只开 ASCII 口；3E/4E 二进制帧经 hex 编码后按此格式收发
+// ===== v1.5.1: 串口 ASCII 通信模式（二进制帧 → hex + STX/ETX/checksum）=====
+// ⚠ 仅适用于 RS-232/485 C24 串口模块；以太网 SLMP ASCII Code 请用 toAsciiHex / dehexifyFrame
+// 部分老旧现场只开串口 ASCII；3E/4E 二进制帧经 hex 编码后按此格式收发
 
-/** 二进制 Buffer → ASCII 帧 Buffer。格式: STX(1) + hex(2N) + ETX(1) + checksum(2 hex ASCII) */
+/** 二进制 Buffer → 串口 ASCII 帧 Buffer。格式: STX(1) + hex(2N) + ETX(1) + checksum(2 hex ASCII) */
 function asciify(buf) {
   var sum = 0;
   var hex = '';
@@ -345,7 +346,7 @@ function asciify(buf) {
 }
 
 /**
- * 从累加缓冲区中提取 ASCII 帧。
+ * 从累加缓冲区中提取串口 ASCII 帧。
  * 返回 { result: Buffer, consumed: number } 成功，
  * 或 { consumed: number } 等待更多数据，
  * 或 { err, consumed } 格式错误（已跳过坏帧）。
@@ -389,6 +390,65 @@ function deasciify(buf) {
   }
 
   return { result: result, consumed: totalNeeded };
+}
+
+// ===== v1.5.2: SLMP ASCII Code（以太网 — 二进制帧 ⟷ hex 编解码，无 STX/ETX/校验和）=====
+// 三菱 SLMP（以太网 MC 协议）支持两种通信数据代码：
+//   Binary Code：原始 3E/4E 二进制帧（默认）
+//   ASCII Code：整帧逐字节转 2 个 hex 字元，无任何帧头/帧尾/校验和（TCP 保证完整性）
+// 此功能用于连接以太网口设置为 ASCII Code 的 PLC（旧设备/特定场景）
+
+/** 二进制 Buffer → SLMP ASCII Code hex Buffer（纯 hex 文本，无 STX/ETX/校验和） */
+function toAsciiHex(buf) {
+  var hex = '';
+  for (var i = 0; i < buf.length; i++) {
+    hex += ('0' + buf[i].toString(16)).slice(-2).toUpperCase();
+  }
+  return Buffer.from(hex, 'ascii');
+}
+
+/** SLMP ASCII Code hex Buffer → 二进制 Buffer。失败（非 hex / 奇数长度）返 null */
+function fromAsciiHex(buf) {
+  if (!buf || buf.length === 0 || buf.length % 2 !== 0) return null;
+  var hexStr = buf.toString('ascii');
+  if (!/^[0-9A-Fa-f]*$/.test(hexStr)) return null;
+  var n = hexStr.length / 2;
+  var result = Buffer.alloc(n);
+  for (var i = 0; i < n; i++) {
+    result[i] = parseInt(hexStr.substr(i * 2, 2), 16);
+  }
+  return result;
+}
+
+/**
+ * 从 TCP 累加缓冲区中按 SLMP ASCII Code 提取完整帧并解码为二进制。
+ * buf：累积的 hex 字符 Buffer（由多次 data 事件 concat 而来）
+ * hdrLen：二进制 header 字节数（3E=11, 4E=15）
+ * dataLenOff：header 中 data length 字段偏移（3E=7, 4E=11）
+ *
+ * @returns { result: Buffer, consumed: number } — 成功提取完整帧（result 为二进制）
+ * @returns { consumed: number }              — 数据不足，等待下一 chunk
+ * @returns { err: string, consumed: number } — hex 格式错误（已跳过 consumed 字节）
+ */
+function dehexifyFrame(buf, hdrLen, dataLenOff) {
+  var hexHdrLen = hdrLen * 2;
+  if (buf.length < hexHdrLen) return { consumed: 0 };
+
+  var hdrHex = buf.toString('ascii', 0, hexHdrLen);
+  if (!/^[0-9A-Fa-f]*$/.test(hdrHex)) return { err: 'Non-hex chars in frame header', consumed: 1 };
+
+  var hdrBin = Buffer.alloc(hdrLen);
+  for (var i = 0; i < hdrLen; i++) hdrBin[i] = parseInt(hdrHex.substr(i * 2, 2), 16);
+  var dataLen = hdrBin.readUInt16LE(dataLenOff) - 2;  // 减去 end code 2 字节即为纯数据长度
+  if (dataLen < 0 || dataLen > 2000) return { err: 'dataLen out of range: ' + dataLen, consumed: hexHdrLen };
+
+  var fullBinLen = hdrLen + dataLen;
+  var totalHexLen = fullBinLen * 2;
+  if (buf.length < totalHexLen) return { consumed: 0 };
+
+  var bin = fromAsciiHex(buf.slice(0, totalHexLen));
+  if (!bin) return { err: 'Hex decode failed for full frame', consumed: totalHexLen };
+  return { result: bin, consumed: totalHexLen };
 }
 
 // ===== 写响应解析 =====
@@ -669,6 +729,9 @@ module.exports = {
   buildBitWriteFrame: buildBitWriteFrame,
   asciify: asciify,
   deasciify: deasciify,
+  toAsciiHex: toAsciiHex,
+  fromAsciiHex: fromAsciiHex,
+  dehexifyFrame: dehexifyFrame,
   parseMCResponse: parseMCResponse,
   parseMCWriteResponse: parseMCWriteResponse,
   buildRMWWriteGroup: buildRMWWriteGroup,

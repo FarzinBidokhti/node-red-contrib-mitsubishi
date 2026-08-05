@@ -691,4 +691,111 @@ describe('mc-protocol', function () {
       assert.ok(dec.err && dec.err.indexOf('Invalid hex') >= 0, 'odd hex rejected');
     });
   });
+
+  describe('toAsciiHex / fromAsciiHex / dehexifyFrame (v1.6.0: SLMP ASCII Code)', function () {
+    var build3E = mc.build3EFrame;
+    var build4E = mc.build4EFrame;
+
+    it('toAsciiHex produces pure hex (no STX/ETX)', function () {
+      var bin = build3E(0, 1, 0, 'D', 0);
+      var hex = mc.toAsciiHex(bin);
+      assert.strictEqual(hex.length, bin.length * 2, 'hex length = binary × 2');
+      assert.notStrictEqual(hex[0], 0x02, 'no STX');
+      assert.ok(/^[0-9A-F]+$/.test(hex.toString('ascii')), 'all uppercase hex');
+    });
+
+    it('toAsciiHex → fromAsciiHex round-trip (3E, 21 bytes)', function () {
+      var bin = build3E(100, 3, 0, 'D', 0);
+      var hex = mc.toAsciiHex(bin);
+      var back = mc.fromAsciiHex(hex);
+      assert.ok(back, 'decode success');
+      assert.deepStrictEqual(back, bin, 'round-trip identical');
+    });
+
+    it('toAsciiHex → fromAsciiHex round-trip (4E, 25 bytes)', function () {
+      var bin = build4E(200, 5, 0, 'D', 0, 0xAB12);
+      var hex = mc.toAsciiHex(bin);
+      var back = mc.fromAsciiHex(hex);
+      assert.ok(back, 'decode success');
+      assert.deepStrictEqual(back, bin, 'round-trip identical');
+    });
+
+    it('fromAsciiHex returns null on odd length', function () {
+      assert.strictEqual(mc.fromAsciiHex(Buffer.from('ABC', 'ascii')), null);
+    });
+
+    it('fromAsciiHex returns null on non-hex chars', function () {
+      assert.strictEqual(mc.fromAsciiHex(Buffer.from('ZZZZ', 'ascii')), null);
+    });
+
+    it('dehexifyFrame extracts complete 3E frame from buffer', function () {
+      var bin = build3E(0, 1, 0, 'D', 0);
+      var hex = mc.toAsciiHex(bin);
+      // dehexifyFrame(hdrLen=11, dataLenOff=7)
+      var df = mc.dehexifyFrame(hex, 11, 7);
+      assert.ok(df.result, 'frame extracted');
+      assert.deepStrictEqual(df.result, bin, 'decoded binary matches original');
+      assert.strictEqual(df.consumed, hex.length, 'all hex consumed');
+    });
+
+    it('dehexifyFrame extracts complete 4E frame from buffer', function () {
+      var bin = build4E(0, 1, 0, 'D', 0, 0x5678);
+      var hex = mc.toAsciiHex(bin);
+      var df = mc.dehexifyFrame(hex, 15, 11);
+      assert.ok(df.result, 'frame extracted');
+      assert.deepStrictEqual(df.result, bin, 'round-trip');
+    });
+
+    it('dehexifyFrame waits for incomplete data', function () {
+      var bin = build3E(0, 3, 0, 'D', 0);  // 21 bytes, 42 hex chars
+      var hex = mc.toAsciiHex(bin);
+      var partial = hex.slice(0, 10);  // only 10 hex chars
+      var df = mc.dehexifyFrame(partial, 11, 7);
+      assert.ok(!df.result && !df.err, 'no result, no error → wait for more');
+    });
+
+    it('dehexifyFrame rejects non-hex header', function () {
+      var bad = Buffer.from('ZZZZZZZZZZZZZZZZZZZZZZ', 'ascii');  // 22 hex chars worth
+      var df = mc.dehexifyFrame(bad, 11, 7);
+      assert.ok(df.err, 'non-hex rejected');
+    });
+
+    it('dehexifyFrame rejects out-of-range dataLen', function () {
+      // Build hex with corrupted dataLen (>2000)
+      var bin = build3E(0, 1, 0, 'D', 0);
+      bin.writeUInt16LE(4002, 7);  // dataLen=4002 → after -2 = 4000 > 2000
+      var hex = mc.toAsciiHex(bin);
+      var df = mc.dehexifyFrame(hex, 11, 7);
+      assert.ok(df.err && df.err.indexOf('dataLen') >= 0, 'dataLen out of range rejected');
+    });
+
+    it('dehexifyFrame handles frame with prefix garbage', function () {
+      var bin = build3E(0, 1, 0, 'D', 0);
+      var hex = mc.toAsciiHex(bin);
+      var withGarbage = Buffer.concat([Buffer.from('GARBAGE', 'ascii'), hex]);
+      var df = mc.dehexifyFrame(withGarbage, 11, 7);
+      assert.ok(df.err, 'garbage rejected');
+      assert.strictEqual(df.consumed, 1, 'one non-hex byte consumed');
+    });
+
+    it('dehexifyFrame handles frame with leftover after complete frame', function () {
+      var bin = build3E(0, 1, 0, 'D', 0);
+      var hex = mc.toAsciiHex(bin);
+      var withExtra = Buffer.concat([hex, Buffer.from('EXTRA', 'ascii')]);
+      var df = mc.dehexifyFrame(withExtra, 11, 7);
+      assert.ok(df.result, 'frame extracted');
+      assert.deepStrictEqual(df.result, bin, 'decoded correctly');
+      assert.strictEqual(df.consumed, hex.length, 'only frame bytes consumed, extra left');
+    });
+
+    it('toAsciiHex produces same hex as asciify minus STX/ETX/checksum', function () {
+      var bin = build3E(0, 2, 0, 'D', 0);
+      var ascii = mc.asciify(bin);
+      var hex = mc.toAsciiHex(bin);
+      // asciify: STX(1) + hex(2N) + ETX(1) + checksum(2)
+      var asciiHex = ascii.slice(1, 1 + bin.length * 2);
+      assert.deepStrictEqual(hex.length, asciiHex.length, 'hex parts same length');
+      assert.deepStrictEqual(hex, asciiHex, 'hex content identical (asciify builds the same hex in middle)');
+    });
+  });
 });

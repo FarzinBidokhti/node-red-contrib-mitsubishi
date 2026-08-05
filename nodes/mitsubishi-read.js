@@ -332,7 +332,7 @@ module.exports = function (RED) {
           wordOrder: t.wordOrder || null,
           // 🔧 v1.4.4: bitOffset 钳制 0-15（越界此前会被 JS 按 mod 32 移位静默取错位）
           bitOffset: (function () {
-            if (t.bitOffset === undefined || t.bitOffset === null) return null;
+            if (t.bitOffset === undefined || t.bitOffset === null || String(t.bitOffset).trim() === '') return null;
             var bo = parseInt(t.bitOffset, 10);
             if (isNaN(bo) || bo < 0 || bo > 15) {
               node.warn('[MC] Invalid bitOffset ' + t.bitOffset + ' for tag ' + (t.id || t.name || ('#' + i)) + ', using 0');
@@ -508,7 +508,9 @@ module.exports = function (RED) {
       }
 
       // ===== 🔧 v1.4.4: UDP 传输路径（SLMP 原生支持 UDP，帧格式与 TCP 完全一致）=====
+      // ⚠ ASCII Code 在 UDP 路径未实现（无实际应用场景），选 UDP+ASCII 时降级为 Binary
       if (plc.protocol === 'udp') {
+        if (plc.ascii) node.warn('[MC] UDP+ASCII 组合未支持，降级为 UDP+Binary；如需 ASCII 请改用 TCP');
         mcUdp.acquire(node, connKey, plc.timeout, function (aerr, udpEntry) {
           if (aerr) {
             msg.payload = {
@@ -699,7 +701,6 @@ module.exports = function (RED) {
             if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
 
             var buf = Buffer.alloc(0);
-            var asciiBuf = Buffer.alloc(0);  // 🔧 v1.5.1: ASCII 模式累加缓冲
             var resolved = false;
             var _tmoHandler = null, _errHandler = null, _dataHandler = null;
             var _reqTimer = null;  // 🔧 review#4: 请求级兜底定时器
@@ -718,7 +719,7 @@ module.exports = function (RED) {
               var frame = (frameType === '4E')
                 ? mc.build4EFrame(startA, wordCount, stationNo, grp.regType, networkNo, sentSN)
                 : mc.build3EFrame(startA, wordCount, stationNo, grp.regType, networkNo);
-              var wireFrame = plc.ascii ? mc.asciify(frame) : frame;
+              var wireFrame = plc.ascii ? mc.toAsciiHex(frame) : frame;
               mcSocket.write(wireFrame);
             } catch (e) {
               node.warn('[MC] write error: ' + e.message);
@@ -741,33 +742,45 @@ module.exports = function (RED) {
             _dataHandler = function (sock) {
               return function (chunk) {
                 try {
-                  // 🔧 v1.5.1: ASCII 模式 — 累加→解帧→直接解析
+                  // 🔧 v1.6.0: SLMP ASCII Code（以太网 — hex 编解码，无 STX/ETX/校验和）
+                  // 与 Binary Code 的唯一区别：整帧逐字节 → 2 hex 字元
                   if (plc.ascii) {
-                    asciiBuf = Buffer.concat([asciiBuf, chunk]);
-                    while (true) {
-                      var d = mc.deasciify(asciiBuf);
-                      asciiBuf = asciiBuf.slice(d.consumed);
-                      if (d.err) { node.warn('[MC] ASCII decode: ' + d.err); continue; }
-                      if (!d.result) return;  // STX 未到或帧不完整
+                    if (buf.length + chunk.length > 65536) {
                       resolved = true;
                       cleanupListeners(sock);
-                      var asciiRaw = mc.parseMCResponse(d.result, startA, grp.regType, frameType, sentSN);
-                      if (asciiRaw && asciiRaw.mcError) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[PLC 0x' + asciiRaw.mcError.toString(16).toUpperCase() + '] ' + asciiRaw.mcErrorText;
-                        setTimeout(function () { processGroup(gi + 1); }, 0);
-                      } else if (asciiRaw && !asciiRaw.err) {
-                        var groupTs = new Date().toISOString();
-                        grp.tags.forEach(function (t) {
-                          var decoded = mc.decodeTag(asciiRaw, grp.regType, t.addr, t.dataType, t.byteOrder, t.wordOrder, t.bitOffset);
-                          allRaw[t.id] = { rawValue: decoded.rawWord, convertedValue: decoded.value, quality: decoded.quality, ts: groupTs };
-                        });
-                        setTimeout(function () { processGroup(gi + 1); }, 0);
-                      } else {
-                        setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                      }
+                      node.warn('[MC] ASCII buffer overflow ' + (buf.length + chunk.length) + ' bytes');
+                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
                       return;
                     }
+                    buf = Buffer.concat([buf, chunk]);
+                    var _hdrLen = (frameType === '4E') ? 15 : 11;
+                    var _lenOff = (frameType === '4E') ? 11 : 7;
+                    var df = mc.dehexifyFrame(buf, _hdrLen, _lenOff);
+                    if (df.err) {
+                      buf = buf.slice(df.consumed);
+                      node.warn('[MC] ASCII frame error: ' + df.err + ', skipped ' + df.consumed + ' bytes');
+                      return;
+                    }
+                    if (!df.result) return;  // 帧不完整，等更多数据
+                    resolved = true;
+                    cleanupListeners(sock);
+                    buf = buf.slice(df.consumed);  // 消费已处理的帧
+                    var raw = mc.parseMCResponse(df.result, startA, grp.regType, frameType, sentSN);
+                    if (raw && raw.mcError) {
+                      hasFailed = true;
+                      if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
+                      setTimeout(function () { processGroup(gi + 1); }, 0);
+                    } else if (raw && !raw.err) {
+                      var groupTs = new Date().toISOString();
+                      grp.tags.forEach(function (t) {
+                        var decoded = mc.decodeTag(raw, grp.regType, t.addr, t.dataType, t.byteOrder, t.wordOrder, t.bitOffset);
+                        allRaw[t.id] = { rawValue: decoded.rawWord, convertedValue: decoded.value, quality: decoded.quality, ts: groupTs };
+                      });
+                      setTimeout(function () { processGroup(gi + 1); }, 0);
+                    } else {
+                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                    }
+                    return;
                   }
                   if (buf.length + chunk.length > 65536) {
                     resolved = true;
