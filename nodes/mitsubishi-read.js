@@ -22,6 +22,8 @@ module.exports = function (RED) {
   var mc = require('./mc-protocol');
   var mcUdp = require('./mc-udp');  // 🔧 v1.4.4: UDP 传输会话层
 
+  var DEBUG_WIRE = true;  // 🔧 v1.7.0: 线级日志（>>> 发出 / <<< 收到），现场调试用，量产可改 false
+
   // ===== 长连接池 v1.4.0 — 键含帧/网络/站号、并发建连串行化、队列超时、退避
   var CONN_POOL = {};  // key = "host:port:frame:network:station" → entry
   var IN_FLIGHT = {};  // 🔧 v1.4.4: per-PLC 轮次闸（poolKey → node.id），慢 PLC 时新轮次直接丢弃而非排队积压
@@ -54,7 +56,8 @@ module.exports = function (RED) {
 
   function poolKey(plc) {
     // 同一 IP:端口 但帧格式/网络号/站号/传输协议不同不能复用连接（UDP 无连接，key 仅用于会话与轮次闸）
-    return plc.host + ':' + plc.port + ':' + plc.frame + ':' + plc.networkNo + ':' + plc.stationNo + ':' + (plc.protocol || 'tcp');
+    // 🔧 v1.7.0: 键追加 commCode — 同 PLC 不同数据代码（binary/ascii_q/ascii_slmp）不得复用连接
+    return plc.host + ':' + plc.port + ':' + plc.frame + ':' + plc.networkNo + ':' + plc.stationNo + ':' + (plc.protocol || 'tcp') + ':' + (plc.commCode || 'binary');
   }
 
   function getConnection(node, plc, callback) {
@@ -237,7 +240,15 @@ module.exports = function (RED) {
         frame: String(pp.mcFrame || cfg.frame || '3E').toUpperCase(),
         series: pp.plcSeries || cfg.series || 'Q',
         protocol: String(pp.protocol || cfg.protocol || 'tcp').toLowerCase(),  // 🔧 v1.4.4: tcp|udp
-        ascii: !!(pp.ascii !== undefined ? pp.ascii : cfg.ascii),  // 🔧 v1.5.1: ASCII 通信模式
+        // 🔧 v1.7.0: 通信数据代码三态 — binary（默认）/ ascii_q（Q·L·E71 软元件名式，长度=字符数）/ ascii_slmp（FX5·iQ-R hex直译式）
+        // 兼容旧配置：ascii=true → ascii_slmp
+        commCode: (function () {
+          var raw = (pp.commCode !== undefined) ? pp.commCode : cfg.commCode;
+          var cc = String(raw || '').toLowerCase().replace(/[\s-]/g, '_');
+          if (cc === 'ascii_q' || cc === 'ascii_slmp' || cc === 'binary') return cc;
+          var legacy = (pp.ascii !== undefined) ? pp.ascii : cfg.ascii;
+          return legacy ? 'ascii_slmp' : 'binary';
+        })(),
         networkNo: pp.networkNo || cfg.networkNo || 0,
         stationNo: pp.stationNo || cfg.stationNo || 0,
         timeout: mc.clampInt(incoming.timeout || cfg.timeout, 3000, 500, 30000),
@@ -256,6 +267,14 @@ module.exports = function (RED) {
       if (plc.frame !== '3E' && plc.frame !== '4E') {
         msg.payload = { success: false, deviceId: incoming.id || incoming.deviceId, deviceName: incoming.deviceName, data: {}, error: '不支持的 MC 帧格式: ' + plc.frame, driverType: 'driver-mc-protocol' };
         node.error('[MC] 不支持的 MC 帧格式: ' + plc.frame + '（仅支持 3E/4E）', msg);  // 🔧 v1.4.4: 带 msg，catch 节点可捕获
+        node.send(msg);
+        if (done) done();
+        return;
+      }
+      // 🔧 v1.7.1: ascii_q 是 QnA 兼容 3E 时代的格式，无 4E；extractAsciiQResponse 始终产 3E 布局中间帧
+      if (plc.commCode === 'ascii_q' && plc.frame !== '3E') {
+        msg.payload = { success: false, deviceId: incoming.id || incoming.deviceId, deviceName: incoming.deviceName, data: {}, error: 'ascii_q 仅支持 3E 帧', driverType: 'driver-mc-protocol' };
+        node.error('[MC] ascii_q 仅支持 3E 帧', msg);
         node.send(msg);
         if (done) done();
         return;
@@ -362,6 +381,8 @@ module.exports = function (RED) {
       var maxRetries = plc.maxRetries;
       var retryInterval = plc.retryInterval;
       var frameType = plc.frame;
+      // 🔧 v1.7.1: ascii_q 响应始终为 3E 布局中间帧，解析必须按 3E（否则错偏移读乱数据）
+      var respFrameType = (plc.commCode === 'ascii_q') ? '3E' : frameType;
       var stationNo = plc.stationNo;
       var networkNo = plc.networkNo;
       var roundStart = Date.now();
@@ -510,7 +531,7 @@ module.exports = function (RED) {
       // ===== 🔧 v1.4.4: UDP 传输路径（SLMP 原生支持 UDP，帧格式与 TCP 完全一致）=====
       // ⚠ ASCII Code 在 UDP 路径未实现（无实际应用场景），选 UDP+ASCII 时降级为 Binary
       if (plc.protocol === 'udp') {
-        if (plc.ascii) node.warn('[MC] UDP+ASCII 组合未支持，降级为 UDP+Binary；如需 ASCII 请改用 TCP');
+        if (plc.commCode !== 'binary') node.warn('[MC] UDP 仅支持 Binary，' + plc.commCode + ' 已降级；如需 ASCII 请改用 TCP');
         mcUdp.acquire(node, connKey, plc.timeout, function (aerr, udpEntry) {
           if (aerr) {
             msg.payload = {
@@ -672,11 +693,11 @@ module.exports = function (RED) {
           }
 
           function attemptGroup(attempt) {
-            if (node._closed) { releaseConnection(connKey); return; }  // 🔧 v1.4.4: 关闭中止点统一归还连接，防池楔死
+            if (node._closed) { releaseConnection(connKey); return; }
             if (mcSocket.destroyed) {
               destroyConnection(connKey);
               getConnection(node, plc, function (e2, newSock) {
-                if (node._closed) { releaseConnection(connKey); return; }  // 🔧 v1.4.4: 关闭中止点统一归还连接，防池楔死
+                if (node._closed) { releaseConnection(connKey); return; }
                 if (e2) {
                   hasFailed = true;
                   if (!firstError) firstError = '[RECONNECT] ' + e2.message;
@@ -703,53 +724,108 @@ module.exports = function (RED) {
             var buf = Buffer.alloc(0);
             var resolved = false;
             var _tmoHandler = null, _errHandler = null, _dataHandler = null;
-            var _reqTimer = null;  // 🔧 review#4: 请求级兜底定时器
+            var _reqTimer = null;
 
+            // 🔧 v1.7.0: typeof 守卫 — handler 为 null 时 removeListener 抛 TypeError 会崩掉整个 Node-RED
             function cleanupListeners(sock) {
               if (!sock) return;
-              sock.removeListener('data', _dataHandler);
-              sock.removeListener('timeout', _tmoHandler);
-              sock.removeListener('error', _errHandler);
+              if (typeof _dataHandler === 'function') sock.removeListener('data', _dataHandler);
+              if (typeof _tmoHandler === 'function') sock.removeListener('timeout', _tmoHandler);
+              if (typeof _errHandler === 'function') sock.removeListener('error', _errHandler);
               if (_reqTimer) { clearTimeout(_reqTimer); _reqTimer = null; }
             }
 
-            mcSocket.setTimeout(timeout);
-
-            try {
-              var frame = (frameType === '4E')
-                ? mc.build4EFrame(startA, wordCount, stationNo, grp.regType, networkNo, sentSN)
-                : mc.build3EFrame(startA, wordCount, stationNo, grp.regType, networkNo);
-              var wireFrame = plc.ascii ? mc.toAsciiHex(frame) : frame;
-              mcSocket.write(wireFrame);
-            } catch (e) {
-              node.warn('[MC] write error: ' + e.message);
-              resolved = true;
-              cleanupListeners(mcSocket);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e3, newSock2) {
-                if (node._closed) { releaseConnection(connKey); return; }  // 🔧 v1.4.4: 关闭中止点统一归还连接，防池楔死
-                if (e3) {
-                  releaseConnection(connKey);
-                  finishWithError();
-                  return;
-                }
-                mcSocket = newSock2;
-                setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-              });
-              return;
+            function retryLater() {
+              setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+            }
+            function nextGroup() {
+              setTimeout(function () { processGroup(gi + 1); }, 0);
             }
 
-            _dataHandler = function (sock) {
+            // 🔧 v1.7.0: 响应统一处理 — 三种方言都先转成二进制 3E/4E 帧再进这里，解析层零改动
+            function handleResponse(binFrame) {
+              var raw;
+              try {
+                // 🔧 v1.7.1: ascii_q 响应中间帧恒为 3E 布局，用 respFrameType 而非原始 frameType
+                raw = mc.parseMCResponse(binFrame, startA, grp.regType, respFrameType, sentSN);
+              } catch (e) {
+                node.warn('[MC] parse error: ' + e.message);
+                retryLater();
+                return;
+              }
+              if (raw && raw.mcError) {
+                hasFailed = true;
+                if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
+                nextGroup();
+              } else if (raw && !raw.err) {
+                var groupTs = new Date().toISOString();
+                grp.tags.forEach(function (t) {
+                  var decoded = mc.decodeTag(raw, grp.regType, t.addr, t.dataType, t.byteOrder, t.wordOrder, t.bitOffset);
+                  allRaw[t.id] = { rawValue: decoded.rawWord, convertedValue: decoded.value, quality: decoded.quality, ts: groupTs };
+                });
+                nextGroup();
+              } else {
+                retryLater();
+              }
+            }
+
+            // 超时/错误统一处理：销毁连接 → 重连 → 重试
+            function onSockFail(sock) {
+              return function () {
+                if (resolved) return;
+                resolved = true;
+                cleanupListeners(sock);
+                destroyConnection(connKey);
+                getConnection(node, plc, function (e4, newSock3) {
+                  if (node._closed) { releaseConnection(connKey); return; }
+                  if (e4) {
+                    releaseConnection(connKey);
+                    finishWithError();
+                    return;
+                  }
+                  mcSocket = newSock3;
+                  retryLater();
+                });
+              };
+            }
+
+            _dataHandler = (function (sock) {
               return function (chunk) {
                 try {
-                  // 🔧 v1.6.0: SLMP ASCII Code（以太网 — hex 编解码，无 STX/ETX/校验和）
-                  // 与 Binary Code 的唯一区别：整帧逐字节 → 2 hex 字元
-                  if (plc.ascii) {
+                  if (DEBUG_WIRE) {
+                    node.log('[MC] <<< len=' + chunk.length + ' [' +
+                      chunk.toString(plc.commCode === 'binary' ? 'hex' : 'ascii') + ']');
+                  }
+
+                  // --- ascii_q：Q/L/E71 MC 协议 ASCII（软元件名式，长度=字符数）---
+                  if (plc.commCode === 'ascii_q') {
                     if (buf.length + chunk.length > 65536) {
-                      resolved = true;
-                      cleanupListeners(sock);
-                      node.warn('[MC] ASCII buffer overflow ' + (buf.length + chunk.length) + ' bytes');
-                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                      resolved = true; cleanupListeners(sock);
+                      node.warn('[MC] ASCII-Q buffer overflow');
+                      retryLater();
+                      return;
+                    }
+                    buf = Buffer.concat([buf, chunk]);
+                    var ex = mc.extractAsciiQResponse(buf);
+                    if (ex.err) {
+                      buf = buf.slice(ex.consumed);
+                      node.warn('[MC] ASCII-Q frame error: ' + ex.err);
+                      return;
+                    }
+                    if (!ex.result) return;  // 帧不完整，等更多数据
+                    resolved = true;
+                    cleanupListeners(sock);
+                    buf = buf.slice(ex.consumed);
+                    handleResponse(ex.result);
+                    return;
+                  }
+
+                  // --- ascii_slmp：FX5/iQ-R SLMP ASCII（hex 直译）---
+                  if (plc.commCode === 'ascii_slmp') {
+                    if (buf.length + chunk.length > 65536) {
+                      resolved = true; cleanupListeners(sock);
+                      node.warn('[MC] ASCII buffer overflow');
+                      retryLater();
                       return;
                     }
                     buf = Buffer.concat([buf, chunk]);
@@ -758,68 +834,38 @@ module.exports = function (RED) {
                     var df = mc.dehexifyFrame(buf, _hdrLen, _lenOff);
                     if (df.err) {
                       buf = buf.slice(df.consumed);
-                      node.warn('[MC] ASCII frame error: ' + df.err + ', skipped ' + df.consumed + ' bytes');
+                      node.warn('[MC] ASCII frame error: ' + df.err);
                       return;
                     }
-                    if (!df.result) return;  // 帧不完整，等更多数据
+                    if (!df.result) return;
                     resolved = true;
                     cleanupListeners(sock);
-                    buf = buf.slice(df.consumed);  // 消费已处理的帧
-                    var raw = mc.parseMCResponse(df.result, startA, grp.regType, frameType, sentSN);
-                    if (raw && raw.mcError) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
-                      setTimeout(function () { processGroup(gi + 1); }, 0);
-                    } else if (raw && !raw.err) {
-                      var groupTs = new Date().toISOString();
-                      grp.tags.forEach(function (t) {
-                        var decoded = mc.decodeTag(raw, grp.regType, t.addr, t.dataType, t.byteOrder, t.wordOrder, t.bitOffset);
-                        allRaw[t.id] = { rawValue: decoded.rawWord, convertedValue: decoded.value, quality: decoded.quality, ts: groupTs };
-                      });
-                      setTimeout(function () { processGroup(gi + 1); }, 0);
-                    } else {
-                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                    }
+                    buf = buf.slice(df.consumed);
+                    handleResponse(df.result);
                     return;
                   }
+
+                  // --- binary：默认路径 ---
                   if (buf.length + chunk.length > 65536) {
-                    resolved = true;
-                    cleanupListeners(sock);
-                    node.warn('[MC] Buffer overflow ' + (buf.length + chunk.length) + ' bytes, discarding');
-                    setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                    resolved = true; cleanupListeners(sock);
+                    node.warn('[MC] Buffer overflow, discarding');
+                    retryLater();
                     return;
                   }
                   buf = Buffer.concat([buf, chunk]);
-                  // 🔧 v1.4.4: 4E 响应头 15 字节、数据长字段 @11（旧偏移 13/@7 与规范不符）
                   var hdrLen = (frameType === '4E') ? 15 : 11;
-                  if (!resolved && buf.length >= hdrLen) {
+                  if (buf.length >= hdrLen) {
                     var dataLen = buf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
                     if (dataLen < 0 || dataLen > 2000) {
                       resolved = true;
                       cleanupListeners(sock);
-                      setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
+                      retryLater();
                       return;
                     }
                     if (buf.length >= hdrLen + dataLen) {
                       resolved = true;
                       cleanupListeners(sock);
-                      var raw = mc.parseMCResponse(buf, startA, grp.regType, frameType, sentSN);
-
-                      if (raw && raw.mcError) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[PLC 0x' + raw.mcError.toString(16).toUpperCase() + '] ' + raw.mcErrorText;
-                        setTimeout(function () { processGroup(gi + 1); }, 0);
-                      } else if (raw && !raw.err) {
-                        var groupTs = new Date().toISOString();
-                        grp.tags.forEach(function (t) {
-                          // 🔧 v1.4.4: 解码逻辑提取至 mc.decodeTag（可单测，行为不变）
-                          var decoded = mc.decodeTag(raw, grp.regType, t.addr, t.dataType, t.byteOrder, t.wordOrder, t.bitOffset);
-                          allRaw[t.id] = { rawValue: decoded.rawWord, convertedValue: decoded.value, quality: decoded.quality, ts: groupTs };
-                        });
-                        setTimeout(function () { processGroup(gi + 1); }, 0);
-                      } else {
-                        setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                      }
+                      handleResponse(buf);
                     }
                   }
                 } catch (e) {
@@ -828,61 +874,60 @@ module.exports = function (RED) {
                   resolved = true;
                   hasFailed = true;
                   if (!firstError) firstError = '[DATA] ' + e.message;
-                  setTimeout(function () { processGroup(gi + 1); }, 0);
+                  nextGroup();
                 }
               };
-            }(mcSocket);
+            })(mcSocket);
 
+            _tmoHandler = onSockFail(mcSocket);
+            _errHandler = onSockFail(mcSocket);
+
+            // 🔧 v1.7.0: 先注册监听器，再写帧（旧版顺序相反，write 失败时 cleanup 引用 null handler 导致进程崩溃）
             mcSocket.on('data', _dataHandler);
-
-            _tmoHandler = function (sock) {
-              return function () {
-                if (resolved) return;
-                resolved = true;
-                cleanupListeners(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e4, newSock3) {
-                  if (node._closed) { releaseConnection(connKey); return; }  // 🔧 v1.4.4: 关闭中止点统一归还连接，防池楔死
-                  if (e4) {
-                    releaseConnection(connKey);
-                    finishWithError();
-                    return;
-                  }
-                  mcSocket = newSock3;
-                  setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
             mcSocket.once('timeout', _tmoHandler);
-
-            _errHandler = function (sock) {
-              return function () {
-                if (resolved) return;
-                resolved = true;
-                cleanupListeners(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e5, newSock4) {
-                  if (node._closed) { releaseConnection(connKey); return; }  // 🔧 v1.4.4: 关闭中止点统一归还连接，防池楔死
-                  if (e5) {
-                    releaseConnection(connKey);
-                    finishWithError();
-                    return;
-                  }
-                  mcSocket = newSock4;
-                  setTimeout(function () { attemptGroup(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
             mcSocket.once('error', _errHandler);
+            mcSocket.setTimeout(timeout);
 
-            // 🔧 review#4: 请求级兜底定时器 — socket.setTimeout 是空闲超时（逐字节慢响应会持续重置），
-            // 极端慢滴漏场景下请求会无限挂起；此处保证 write 后 timeout 内必须拿到完整帧。
-            // 注意：_tmoHandler 经 IIFE 已是内层函数（sock 走闭包），裸调用即可，传参再调会 TypeError。
+            // 请求级兜底定时器（socket.setTimeout 是空闲超时，防慢滴漏无限挂起）
             _reqTimer = setTimeout(function () {
               if (resolved) return;
               node.warn('[MC] request-level timeout (slow-drip response or stuck peer)');
               _tmoHandler();
             }, timeout);
+
+            // 组帧 + 发送（三方言）
+            try {
+              var wireFrame;
+              if (plc.commCode === 'ascii_q') {
+                wireFrame = mc.build3EAsciiQReadFrame(startA, wordCount, stationNo, grp.regType, networkNo);
+              } else {
+                var frame = (frameType === '4E')
+                  ? mc.build4EFrame(startA, wordCount, stationNo, grp.regType, networkNo, sentSN)
+                  : mc.build3EFrame(startA, wordCount, stationNo, grp.regType, networkNo);
+                wireFrame = (plc.commCode === 'ascii_slmp') ? mc.toAsciiHex(frame) : frame;
+              }
+              if (DEBUG_WIRE) {
+                node.log('[MC] >>> len=' + wireFrame.length + ' [' +
+                  wireFrame.toString(plc.commCode === 'binary' ? 'hex' : 'ascii') + ']');
+              }
+              mcSocket.write(wireFrame);
+            } catch (e) {
+              node.warn('[MC] write error: ' + e.message);
+              resolved = true;
+              cleanupListeners(mcSocket);
+              destroyConnection(connKey);
+              getConnection(node, plc, function (e3, newSock2) {
+                if (node._closed) { releaseConnection(connKey); return; }
+                if (e3) {
+                  releaseConnection(connKey);
+                  finishWithError();
+                  return;
+                }
+                mcSocket = newSock2;
+                retryLater();
+              });
+              return;
+            }
           }
           attemptGroup(0);
         }

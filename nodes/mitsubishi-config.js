@@ -16,6 +16,7 @@ module.exports = function (RED) {
     this.stationNo = parseInt(config.stationNo, 10) || 0;
     this.timeout = parseInt(config.timeout, 10) || 3000;
     this.maxRetries = parseInt(config.maxRetries, 10);
+    this.commCode = config.commCode;
     if (isNaN(this.maxRetries)) this.maxRetries = 2;
     this.retryInterval = parseInt(config.retryInterval, 10);
     if (isNaN(this.retryInterval)) this.retryInterval = 300;

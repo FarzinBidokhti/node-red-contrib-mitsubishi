@@ -35,10 +35,11 @@
     </select>
   </div>
   <div class="form-row">
-    <label for="node-config-input-ascii"><i class="fa fa-font"></i> 通信模式</label>
-    <select id="node-config-input-ascii">
-      <option value="false" selected>Binary（默认，3E/4E 二进制）</option>
-      <option value="true">ASCII（Hex编码 + STX/ETX/校验和，部分老旧PLC只开ASCII口）</option>
+    <label for="node-config-input-commCode"><i class="fa fa-font"></i> 数据代码</label>
+    <select id="node-config-input-commCode">
+      <option value="binary" selected>Binary（默认，绝大多数设备）</option>
+      <option value="ascii_q">ASCII-Q（Q/L/E71 老式 MC 协议，软元件名式）</option>
+      <option value="ascii_slmp">ASCII-SLMP（FX5/iQ-R，hex 直译式）</option>
     </select>
   </div>
   <div class="form-row">
@@ -74,6 +75,7 @@
       series: { value: 'Q' },
       protocol: { value: 'tcp', required: true },
       ascii: { value: false },
+      commCode: { value: 'binary' }, 
       networkNo: { value: 0, validate: RED.validators.number() },
       stationNo: { value: 0, validate: RED.validators.number() },
       timeout: { value: 3000, validate: RED.validators.number() },

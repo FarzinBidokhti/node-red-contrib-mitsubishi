@@ -35,6 +35,7 @@ var MC_ERROR_CODES = {
   0xC050: 'CPU busy', 0xC051: 'Device not supported', 0xC052: 'Address out of range',
   0xC053: 'Batch size out of range', 0xC054: 'Write protect error',
   0xC055: 'Remote operation error', 0xC056: 'File not found', 0xC057: 'File name error',
+  0xC058: 'ASCII数据长与字符区不符',
   0xC059: 'Points out of range', 0xC05B: 'CPU type mismatch', 0xC05C: 'Remote password error',
   0xC05F: 'CPU module error', 0xC061: 'Monitor timer timeout',
   0xC06F: 'ASCII code error', 0xC070: 'Frame length error',
@@ -399,25 +400,126 @@ function deasciify(buf) {
 // 此功能用于连接以太网口设置为 ASCII Code 的 PLC（旧设备/特定场景）
 
 /** 二进制 Buffer → SLMP ASCII Code hex Buffer（纯 hex 文本，无 STX/ETX/校验和） */
+// ===== v1.5.2 修正: SLMP ASCII Code 按字段正确编解码 =====
+
+/** 二进制帧 → SLMP ASCII Code（按字段正确编码，UInt16 转大端 hex 字符串） */
 function toAsciiHex(buf) {
+  if (!buf || buf.length < 11) return Buffer.alloc(0);
+  var is4E = (buf[0] === 0x54 || buf[0] === 0xD4);
   var hex = '';
-  for (var i = 0; i < buf.length; i++) {
-    hex += ('0' + buf[i].toString(16)).slice(-2).toUpperCase();
+  
+  function b2h(b) { return ('0' + b.toString(16)).slice(-2).toUpperCase(); }
+  function u16le2h(off) { return buf.readUInt16LE(off).toString(16).padStart(4, '0').toUpperCase(); }
+  
+  if (is4E) {
+    if (buf.length < 15) return Buffer.alloc(0);
+    hex += b2h(buf[0]);      // 子头低
+    hex += b2h(buf[1]);      // 子头高
+    hex += u16le2h(2);       // 序列号
+    hex += u16le2h(4);       // 固定值 0000
+    hex += b2h(buf[6]);      // 网络号
+    hex += b2h(buf[7]);      // PC号
+    hex += u16le2h(8);       // IO编号
+    hex += b2h(buf[10]);     // 站号
+    hex += u16le2h(11);      // 数据长度
+    hex += u16le2h(13);      // 监视定时器
+    hex += u16le2h(15);      // 命令
+    hex += u16le2h(17);      // 子命令
+    for (var i = 19; i <= 21; i++) hex += b2h(buf[i]); // 地址 3 字节
+    hex += b2h(buf[22]);     // 设备代码
+    hex += u16le2h(23);      // 点数
+    for (var i = 25; i < buf.length; i++) hex += b2h(buf[i]); // 后续数据
+  } else {
+    // 3E 帧
+    hex += b2h(buf[0]);      // 子头低
+    hex += b2h(buf[1]);      // 子头高
+    hex += b2h(buf[2]);      // 网络号
+    hex += b2h(buf[3]);      // PC号
+    hex += u16le2h(4);       // IO编号
+    hex += b2h(buf[6]);      // 站号
+    hex += u16le2h(7);       // 数据长度
+    hex += u16le2h(9);       // 监视定时器
+    hex += u16le2h(11);      // 命令
+    hex += u16le2h(13);      // 子命令
+    for (var i = 15; i <= 17; i++) hex += b2h(buf[i]); // 地址 3 字节
+    hex += b2h(buf[18]);     // 设备代码
+    hex += u16le2h(19);      // 点数
+    for (var i = 21; i < buf.length; i++) hex += b2h(buf[i]); // 后续数据
   }
   return Buffer.from(hex, 'ascii');
 }
 
-/** SLMP ASCII Code hex Buffer → 二进制 Buffer。失败（非 hex / 奇数长度）返 null */
-function fromAsciiHex(buf) {
-  if (!buf || buf.length === 0 || buf.length % 2 !== 0) return null;
-  var hexStr = buf.toString('ascii');
+/** SLMP ASCII Code → 二进制帧（按字段正确解码，UInt16 大端字符串转回 UInt16LE） */
+function fromAsciiHex(asciiBuf) {
+  if (!asciiBuf || asciiBuf.length === 0 || asciiBuf.length % 2 !== 0) return null;
+  var hexStr = asciiBuf.toString('ascii');
   if (!/^[0-9A-Fa-f]*$/.test(hexStr)) return null;
-  var n = hexStr.length / 2;
-  var result = Buffer.alloc(n);
-  for (var i = 0; i < n; i++) {
-    result[i] = parseInt(hexStr.substr(i * 2, 2), 16);
+  
+  var subheader = parseInt(hexStr.substr(0, 2), 16);
+  var is4E = (subheader === 0x54 || subheader === 0xD4);
+  var is3E = (subheader === 0x50 || subheader === 0xD0);
+  if (!is3E && !is4E) return null;
+  
+  function h2b(off) { return parseInt(hexStr.substr(off, 2), 16); }
+  function h2u16le(hexOff, buf, bufOff) {
+    var val = parseInt(hexStr.substr(hexOff, 4), 16);
+    buf.writeUInt16LE(val, bufOff);
+  }
+  
+  var result;
+  if (is4E) {
+    if (hexStr.length < 50) return null;
+    result = Buffer.alloc(hexStr.length / 2);
+    result[0] = h2b(0);  result[1] = h2b(2);
+    h2u16le(4, result, 2);   h2u16le(8, result, 4);
+    result[6] = h2b(12);     result[7] = h2b(14);
+    h2u16le(16, result, 8);  result[10] = h2b(20);
+    h2u16le(22, result, 11); h2u16le(26, result, 13);
+    h2u16le(30, result, 15); h2u16le(34, result, 17);
+    result[19] = h2b(38);    result[20] = h2b(40);
+    result[21] = h2b(42);    result[22] = h2b(44);
+    h2u16le(46, result, 23);
+    for (var i = 50; i < hexStr.length; i += 2) result[25 + (i - 50) / 2] = h2b(i);
+  } else {
+    if (hexStr.length < 42) return null;
+    result = Buffer.alloc(hexStr.length / 2);
+    result[0] = h2b(0);  result[1] = h2b(2);
+    result[2] = h2b(4);  result[3] = h2b(6);
+    h2u16le(8, result, 4);   result[6] = h2b(12);
+    h2u16le(14, result, 7);  h2u16le(18, result, 9);
+    h2u16le(22, result, 11); h2u16le(26, result, 13);
+    result[15] = h2b(30);    result[16] = h2b(32);
+    result[17] = h2b(34);    result[18] = h2b(36);
+    h2u16le(38, result, 19);
+    for (var i = 42; i < hexStr.length; i += 2) result[21 + (i - 42) / 2] = h2b(i);
   }
   return result;
+}
+
+/** 从 TCP 累加缓冲区中提取完整 ASCII 帧并解码为二进制 */
+function dehexifyFrame(buf, hdrLen, dataLenOff) {
+  var asciiHdrLen = hdrLen * 2;
+  if (buf.length < asciiHdrLen) return { consumed: 0 };
+  
+  var hdrHex = buf.toString('ascii', 0, asciiHdrLen);
+  if (!/^[0-9A-Fa-f]*$/.test(hdrHex)) return { err: 'Non-hex chars in frame header', consumed: 1 };
+  
+  var subheader = parseInt(hdrHex.substr(0, 2), 16);
+  var is4E = (subheader === 0x54 || subheader === 0xD4);
+  
+  // ASCII 中数据长度字段偏移 = 二进制偏移 * 2，长度 4 字符
+  var asciiDataLenOff = dataLenOff * 2;
+  var dataLen = parseInt(hdrHex.substr(asciiDataLenOff, 4), 16) - 2;
+  
+  if (dataLen < 0 || dataLen > 2000) return { err: 'dataLen out of range: ' + dataLen, consumed: asciiHdrLen };
+  
+  var fullBinLen = hdrLen + dataLen;
+  var totalHexLen = fullBinLen * 2;
+  if (buf.length < totalHexLen) return { consumed: 0 };
+  
+  var bin = fromAsciiHex(buf.slice(0, totalHexLen));
+  if (!bin) return { err: 'Hex decode failed for full frame', consumed: totalHexLen };
+  return { result: bin, consumed: totalHexLen };
 }
 
 /**
@@ -430,26 +532,7 @@ function fromAsciiHex(buf) {
  * @returns { consumed: number }              — 数据不足，等待下一 chunk
  * @returns { err: string, consumed: number } — hex 格式错误（已跳过 consumed 字节）
  */
-function dehexifyFrame(buf, hdrLen, dataLenOff) {
-  var hexHdrLen = hdrLen * 2;
-  if (buf.length < hexHdrLen) return { consumed: 0 };
 
-  var hdrHex = buf.toString('ascii', 0, hexHdrLen);
-  if (!/^[0-9A-Fa-f]*$/.test(hdrHex)) return { err: 'Non-hex chars in frame header', consumed: 1 };
-
-  var hdrBin = Buffer.alloc(hdrLen);
-  for (var i = 0; i < hdrLen; i++) hdrBin[i] = parseInt(hdrHex.substr(i * 2, 2), 16);
-  var dataLen = hdrBin.readUInt16LE(dataLenOff) - 2;  // 减去 end code 2 字节即为纯数据长度
-  if (dataLen < 0 || dataLen > 2000) return { err: 'dataLen out of range: ' + dataLen, consumed: hexHdrLen };
-
-  var fullBinLen = hdrLen + dataLen;
-  var totalHexLen = fullBinLen * 2;
-  if (buf.length < totalHexLen) return { consumed: 0 };
-
-  var bin = fromAsciiHex(buf.slice(0, totalHexLen));
-  if (!bin) return { err: 'Hex decode failed for full frame', consumed: totalHexLen };
-  return { result: bin, consumed: totalHexLen };
-}
 
 // ===== 写响应解析 =====
 // 写响应无数据区：3E 结束码 @9、4E 结束码 @13
@@ -699,6 +782,82 @@ function applyTransform(rawValue, tagDef) {
   return roundEng(rawValue * slope + offset);
 }
 
+
+// ===== v1.7.0: Q 系列 MC 协议 ASCII（ascii_q，Q06UDEH 实机验证 2026-08-06）=====
+// 与 SLMP ASCII（hex 直译）的两个关键差异：
+//   ① 设备段 = 软元件名(2字符) + 6位地址（X/Y/W/B 十六进制，D/M/L/R 十进制）
+//   ② 数据长字段 = 其后的 ASCII 字符数（不是二进制字节数）
+var MC_DEVICE_NAMES = { D: 'D*', W: 'W*', X: 'X*', Y: 'Y*', M: 'M*', L: 'L*', B: 'B*', R: 'R*' };
+
+function _h2(v) { return ('0' + v.toString(16)).slice(-2).toUpperCase(); }
+function _h4(v) { return ('000' + v.toString(16)).slice(-4).toUpperCase(); }
+function _isHexNameDev(rt) { return rt === 'X' || rt === 'Y' || rt === 'W' || rt === 'B'; }
+function _addr6(startAddr, regType) {
+  var s = _isHexNameDev(regType) ? startAddr.toString(16).toUpperCase() : String(startAddr);
+  return ('000000' + s).slice(-6);
+}
+
+/** ascii_q 读请求（0401 字单位）→ ASCII 文本帧 Buffer */
+function build3EAsciiQReadFrame(startAddr, wordCount, stationNo, regType, networkNo) {
+  if (!(wordCount >= 1 && wordCount <= 960)) throw new Error('wordCount out of range (1-960): ' + wordCount);
+  var body = '0010' + '0401' + '0000' + (MC_DEVICE_NAMES[regType] || 'D*') + _addr6(startAddr, regType) + _h4(wordCount);
+  var head = '5000' + _h2(networkNo || 0) + 'FF' + '03FF' + _h2(stationNo || 0);
+  return Buffer.from(head + _h4(body.length) + body, 'ascii');
+}
+
+/**
+ * ascii_q 响应提取：TCP 累加缓冲 → 二进制 3E 响应帧（直接复用 parseMCResponse）
+ * 返回 { result, consumed } / { consumed } 数据不足 / { err, consumed } 格式错误
+ */
+function extractAsciiQResponse(buf) {
+  if (buf.length < 18) return { consumed: 0 };
+  var head = buf.toString('ascii', 0, 18);
+  if (!/^[0-9A-Fa-f]{18}$/.test(head) || head.substr(0, 4).toUpperCase() !== 'D000') {
+    return { err: 'Bad ASCII-Q header', consumed: 1 };
+  }
+  var dataChars = parseInt(head.substr(14, 4), 16);   // ← 字符数语义（实机确认）
+  if (isNaN(dataChars) || dataChars < 4 || dataChars > 8000) return { err: 'Bad dataLen: ' + head.substr(14, 4), consumed: 18 };
+  var total = 18 + dataChars;
+  if (buf.length < total) return { consumed: 0 };     // 帧不完整，等更多数据
+  var text = buf.toString('ascii', 0, total);
+  var endCode = parseInt(text.substr(18, 4), 16);
+  // 🔧 v1.7.1: ASCII 数据区是"数值的字符表示"（值30 → "001E"），不是内存字节序；
+  // 逐字解析再按 LE 写入二进制中间帧，下游 readInt16LE 才能读出原值（否则 30 变 7680）
+  var payload;
+  if (endCode === 0) {
+    var dataHex = text.substr(22);
+    var nWords = Math.floor(dataHex.length / 4);
+    payload = Buffer.alloc(nWords * 2);
+    for (var wi = 0; wi < nWords; wi++) {
+      payload.writeUInt16LE(parseInt(dataHex.substr(wi * 4, 4), 16) & 0xFFFF, wi * 2);
+    }
+  } else {
+    payload = Buffer.from(text.substr(22), 'hex');  // 错误详情为字段结构，原样保留备查
+  }
+  var bin = Buffer.alloc(11 + payload.length);
+  bin[0] = 0xD0; bin[1] = 0x00;
+  bin[2] = parseInt(text.substr(4, 2), 16);
+  bin[3] = parseInt(text.substr(6, 2), 16);
+  bin[4] = 0xFF; bin[5] = 0x03;
+  bin[6] = parseInt(text.substr(12, 2), 16);
+  bin.writeUInt16LE(2 + payload.length, 7);           // 二进制语义：含结束码 2 字节
+  bin.writeUInt16LE(endCode, 9);
+  payload.copy(bin, 11);
+  return { result: bin, consumed: total };
+}
+
+/** ascii_q 批量写请求（1401 字单位）→ ASCII 文本帧 Buffer
+ *  数据区每字 = 4 位大写 hex（值 30 → "001E"），与读取解析互逆 */
+function build3EAsciiQWriteFrame(startAddr, words, stationNo, regType, networkNo) {
+  var wc = (words || []).length;
+  if (!(wc >= 1 && wc <= 960)) throw new Error('wordCount out of range (1-960): ' + wc);
+  var data = '';
+  for (var i = 0; i < wc; i++) data += _h4(words[i] & 0xFFFF);
+  var body = '0010' + '1401' + '0000' + (MC_DEVICE_NAMES[regType] || 'D*') + _addr6(startAddr, regType) + _h4(wc) + data;
+  var head = '5000' + _h2(networkNo || 0) + 'FF' + '03FF' + _h2(stationNo || 0);
+  return Buffer.from(head + _h4(body.length) + body, 'ascii');
+}
+
 module.exports = {
   MC_DEVICE_CODES: MC_DEVICE_CODES,
   BIT_DEVICES: BIT_DEVICES,
@@ -730,6 +889,9 @@ module.exports = {
   asciify: asciify,
   deasciify: deasciify,
   toAsciiHex: toAsciiHex,
+  build3EAsciiQReadFrame: build3EAsciiQReadFrame,
+  build3EAsciiQWriteFrame: build3EAsciiQWriteFrame,
+  extractAsciiQResponse: extractAsciiQResponse,
   fromAsciiHex: fromAsciiHex,
   dehexifyFrame: dehexifyFrame,
   parseMCResponse: parseMCResponse,

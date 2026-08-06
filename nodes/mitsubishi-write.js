@@ -1,5 +1,10 @@
 /**
- * mitsubishi-write — 三菱 MC Protocol 3E/4E 写入节点 v1.5.1
+ * mitsubishi-write — 三菱 MC Protocol 3E/4E 写入节点 v1.7.0
+ *
+ * v1.7.0: commCode 三态（binary/ascii_q/ascii_slmp）、ascii_q 字写（build3EAsciiQWriteFrame）、
+ *         ascii_q 位写改走 RMW（原生位打包未实机验证，RMW 用已验证的字单位帧）、
+ *         TCP 路径统一 wireRequest 助手（四套监听器样板归一）、
+ *         先注册监听器再 write（根治 null-handler 崩溃）、DEBUG_WIRE 线级日志
  *
  * v1.5.1: 位设备原生位写（0x1401/0x0001，M/X/Y/L/B 单往返无 RMW 竞态）、
  *         写分组严格连续（groupTagsContiguous，杜绝间隙填 0 清空 PLC）、
@@ -16,6 +21,8 @@ module.exports = function (RED) {
   var net = require('net');
   var mc = require('./mc-protocol');
   var mcUdp = require('./mc-udp');
+
+  var DEBUG_WIRE = true;  // 🔧 v1.7.0: 线级日志（>>> 发出 / <<< 收到），现场调试用，量产可改 false
 
   // 🔧 v1.6.0: 面板默认值列是字符串，统一按类型收敛。
   // BOOL 用词表（true/1/on），避免字符串 "false"/"0" 被 truthy 误判为写 1；
@@ -64,7 +71,8 @@ module.exports = function (RED) {
   }
 
   function poolKey(plc) {
-    return plc.host + ':' + plc.port + ':' + plc.frame + ':' + plc.networkNo + ':' + plc.stationNo + ':' + (plc.protocol || 'tcp');
+    // 🔧 v1.7.0: 键追加 commCode — 同 PLC 不同数据代码不得复用连接
+    return plc.host + ':' + plc.port + ':' + plc.frame + ':' + plc.networkNo + ':' + plc.stationNo + ':' + (plc.protocol || 'tcp') + ':' + (plc.commCode || 'binary');
   }
 
   function getConnection(node, plc, callback) {
@@ -236,7 +244,15 @@ module.exports = function (RED) {
         frame: String(pp.mcFrame || cfg.frame || '3E').toUpperCase(),
         series: pp.plcSeries || cfg.series || 'Q',
         protocol: String(pp.protocol || cfg.protocol || 'tcp').toLowerCase(),
-        ascii: !!(pp.ascii !== undefined ? pp.ascii : cfg.ascii),  // 🔧 v1.5.1: ASCII 通信模式
+        // 🔧 v1.7.0: 通信数据代码三态 — binary（默认）/ ascii_q（Q·L·E71 软元件名式，长度=字符数）/ ascii_slmp（FX5·iQ-R hex直译式）
+        // 兼容旧配置：ascii=true → ascii_slmp
+        commCode: (function () {
+          var raw = (pp.commCode !== undefined) ? pp.commCode : cfg.commCode;
+          var cc = String(raw || '').toLowerCase().replace(/[\s-]/g, '_');
+          if (cc === 'ascii_q' || cc === 'ascii_slmp' || cc === 'binary') return cc;
+          var legacy = (pp.ascii !== undefined) ? pp.ascii : cfg.ascii;
+          return legacy ? 'ascii_slmp' : 'binary';
+        })(),
         networkNo: pp.networkNo || cfg.networkNo || 0,
         stationNo: pp.stationNo || cfg.stationNo || 0,
         timeout: mc.clampInt(incoming.timeout || cfg.timeout, 3000, 500, 30000),
@@ -254,6 +270,14 @@ module.exports = function (RED) {
       if (plc.frame !== '3E' && plc.frame !== '4E') {
         msg.payload = { success: false, deviceId: incoming.id || incoming.deviceId, deviceName: incoming.deviceName, data: {}, error: '不支持的 MC 帧格式: ' + plc.frame, driverType: 'driver-mc-write-protocol' };
         node.error('[MC-WRITE] 不支持的 MC 帧格式: ' + plc.frame + '（仅支持 3E/4E）', msg);
+        node.send(msg);
+        if (done) done();
+        return;
+      }
+      // 🔧 v1.7.0: ascii_q 是 QnA 兼容 3E 时代的格式，无 4E
+      if (plc.commCode === 'ascii_q' && plc.frame !== '3E') {
+        msg.payload = { success: false, deviceId: incoming.id || incoming.deviceId, deviceName: incoming.deviceName, data: {}, error: 'ascii_q 仅支持 3E 帧', driverType: 'driver-mc-write-protocol' };
+        node.error('[MC-WRITE] ascii_q 仅支持 3E 帧', msg);
         node.send(msg);
         if (done) done();
         return;
@@ -431,7 +455,9 @@ module.exports = function (RED) {
           node.warn('[MC-WRITE] X device write may be overwritten by PLC scan — 建议改用 M 或 B 继电器');
         }
         if (isBitDevice) {
-          bitDeviceTags.push(at);
+          // 🔧 v1.7.0: ascii_q 原生位写打包未实机验证 → 位设备写改走 RMW（字单位帧已实机验证，安全优先）
+          if (plc.commCode === 'ascii_q') wordBoolTags.push(at);
+          else bitDeviceTags.push(at);
         } else if (at.dataType === 'BOOL') {
           wordBoolTags.push(at);  // 字内位→RMW
         } else {
@@ -555,7 +581,7 @@ module.exports = function (RED) {
       // ===== UDP 路径 =====
       // ⚠ ASCII Code 在 UDP 路径未实现，选 UDP+ASCII 时降级为 Binary
       if (plc.protocol === 'udp') {
-        if (plc.ascii) node.warn('[MC-WRITE] UDP+ASCII 组合未支持，降级为 UDP+Binary；如需 ASCII 请改用 TCP');
+        if (plc.commCode !== 'binary') node.warn('[MC-WRITE] UDP 仅支持 Binary，' + plc.commCode + ' 已降级；如需 ASCII 请改用 TCP');
         mcUdp.acquire(node, connKey, plc.timeout, function (aerr, udpEntry) {
           if (aerr) {
             msg.payload = {
@@ -830,6 +856,162 @@ module.exports = function (RED) {
           return;
         }
 
+        // 🔧 v1.7.0: ascii_q 响应经 extractAsciiQResponse 转成 3E 布局二进制帧，解析一律按 3E
+        var respFrameType = (plc.commCode === 'ascii_q') ? '3E' : frameType;
+        var respDataStart = (respFrameType === '4E') ? 15 : 11;
+
+        // 🔧 v1.7.0: 三方言组帧（读/写）
+        function buildReadWire(addr, count, regType, sentSN) {
+          if (plc.commCode === 'ascii_q') {
+            if (typeof mc.build3EAsciiQReadFrame !== 'function')
+              throw new Error('mc-protocol.js 版本过旧：缺少 build3EAsciiQReadFrame，请用 v1.7.2 的 mc-protocol.js 覆盖并重启 Node-RED');
+            return mc.build3EAsciiQReadFrame(addr, count, stationNo, regType, networkNo);
+          }
+          var f = (frameType === '4E')
+            ? mc.build4EFrame(addr, count, stationNo, regType, networkNo, sentSN)
+            : mc.build3EFrame(addr, count, stationNo, regType, networkNo);
+          return (plc.commCode === 'ascii_slmp') ? mc.toAsciiHex(f) : f;
+        }
+        function buildWriteWire(addr, words, regType, sentSN) {
+          if (plc.commCode === 'ascii_q') {
+            if (typeof mc.build3EAsciiQWriteFrame !== 'function')
+              throw new Error('mc-protocol.js 版本过旧：缺少 build3EAsciiQWriteFrame，请用 v1.7.2 的 mc-protocol.js 覆盖并重启 Node-RED');
+            return mc.build3EAsciiQWriteFrame(addr, words, stationNo, regType, networkNo);
+          }
+          var f = mc.buildWriteFrame(frameType, addr, words, stationNo, regType, networkNo, sentSN);
+          return (plc.commCode === 'ascii_slmp') ? mc.toAsciiHex(f) : f;
+        }
+
+        // 🔧 v1.7.0: 统一 TCP 请求-响应助手（字写/位写/RMW 共用，四套监听器样板归一）。
+        // 先注册监听器再 write（旧版顺序相反，write 失败即 null-handler 崩溃）；
+        // 请求级兜底定时器；三方言响应统一转二进制帧后回调。
+        // cb(err, binFrame)：err 非空 = 传输层失败（socket 已销毁重连、mcSocket 已更新），调用方自行重试。
+        function wireRequest(wireFrame, sentSN, cb) {
+          var buf = Buffer.alloc(0);
+          var resolved = false;
+          var _d = null, _t = null, _e = null, _timer = null;
+
+          function cleanup(sock) {
+            if (!sock) return;
+            if (typeof _d === 'function') sock.removeListener('data', _d);
+            if (typeof _t === 'function') sock.removeListener('timeout', _t);
+            if (typeof _e === 'function') sock.removeListener('error', _e);
+            if (_timer) { clearTimeout(_timer); _timer = null; }
+          }
+          function doneOk(binFrame) {
+            if (resolved) return;
+            resolved = true;
+            cleanup(mcSocket);
+            cb(null, binFrame);
+          }
+          function doneErr(e2) {
+            if (resolved) return;
+            resolved = true;
+            cleanup(mcSocket);
+            cb(e2 || new Error('request failed'), null);
+          }
+          function onSockFail() {
+            if (resolved) return;
+            resolved = true;
+            cleanup(mcSocket);
+            destroyConnection(connKey);
+            getConnection(node, plc, function (e3, newSock) {
+              if (!e3 && newSock) mcSocket = newSock;
+              cb(e3 || new Error('socket failed'), null);
+            });
+          }
+
+          _d = function (chunk) {
+            try {
+              if (DEBUG_WIRE) {
+                node.log('[MC-WRITE] <<< len=' + chunk.length + ' [' +
+                  chunk.toString(plc.commCode === 'binary' ? 'hex' : 'ascii') + ']');
+              }
+              if (buf.length + chunk.length > 65536) { doneErr(new Error('Buffer overflow')); return; }
+              buf = Buffer.concat([buf, chunk]);
+
+              // --- ascii_q：Q/L/E71 MC 协议 ASCII ---
+              if (plc.commCode === 'ascii_q') {
+                var ex = mc.extractAsciiQResponse(buf);
+                if (ex.err) { buf = buf.slice(ex.consumed); node.warn('[MC-WRITE] ASCII-Q frame error: ' + ex.err); return; }
+                if (!ex.result) return;
+                doneOk(ex.result);
+                return;
+              }
+              // --- ascii_slmp：FX5/iQ-R SLMP ASCII ---
+              if (plc.commCode === 'ascii_slmp') {
+                var _hl = (frameType === '4E') ? 15 : 11;
+                var _lo = (frameType === '4E') ? 11 : 7;
+                var df = mc.dehexifyFrame(buf, _hl, _lo);
+                if (df.err) { buf = buf.slice(df.consumed); node.warn('[MC-WRITE] ASCII frame error: ' + df.err); return; }
+                if (!df.result) return;
+                doneOk(df.result);
+                return;
+              }
+              // --- binary ---
+              var hdrLen = (frameType === '4E') ? 15 : 11;
+              if (buf.length < hdrLen) return;
+              var dataLen = buf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
+              if (dataLen < 0 || dataLen > 2000) { doneErr(new Error('Bad dataLen: ' + dataLen)); return; }
+              if (buf.length >= hdrLen + dataLen) doneOk(buf.slice(0, hdrLen + dataLen));
+            } catch (e) {
+              doneErr(e);
+            }
+          };
+          _t = onSockFail;
+          _e = onSockFail;
+
+          // 先注册监听器，再写帧
+          mcSocket.on('data', _d);
+          mcSocket.once('timeout', _t);
+          mcSocket.once('error', _e);
+          mcSocket.setTimeout(timeout);
+
+          _timer = setTimeout(function () {
+            if (resolved) return;
+            node.warn('[MC-WRITE] request-level timeout (slow-drip response or stuck peer)');
+            onSockFail();
+          }, timeout);
+
+          try {
+            if (DEBUG_WIRE) {
+              node.log('[MC-WRITE] >>> len=' + wireFrame.length + ' [' +
+                wireFrame.toString(plc.commCode === 'binary' ? 'hex' : 'ascii') + ']');
+            }
+            mcSocket.write(wireFrame);
+          } catch (e) {
+            onSockFail();
+          }
+        }
+
+        // socket 失效时统一重建，成功后调 retry()；重建失败直接 finishWithError
+        function ensureSocket(retry) {
+          if (mcSocket.destroyed) {
+            destroyConnection(connKey);
+            getConnection(node, plc, function (e2, newSock) {
+              if (node._closed) { releaseConnection(connKey); return; }
+              if (e2) { releaseConnection(connKey); finishWithError(); return; }
+              mcSocket = newSock;
+              retry();
+            });
+            return false;
+          }
+          return true;
+        }
+
+        function markTagsBad(tagList) {
+          var ts = new Date().toISOString();
+          tagList.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: ts }; });
+        }
+        function markTagsGood(tagList) {
+          var ts = new Date().toISOString();
+          tagList.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: ts }; });
+        }
+        function markBitsBad(bitList) {
+          var ts = new Date().toISOString();
+          bitList.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: ts }; });
+        }
+
         function processPhase(pi) {
           if (node._closed) { releaseConnection(connKey); return; }
           if (pi >= totalPhases.length) {
@@ -838,148 +1020,14 @@ module.exports = function (RED) {
             return;
           }
           var phase = totalPhases[pi];
-
-          if (phase.type === 'word') {
-            processWordPhase(pi, phase.group);
-          } else if (phase.type === 'bit') {
-            processBitPhase(pi, phase.group);
-          } else {
-            processRMWPhase(pi, phase.group);
-          }
+          if (phase.type === 'word') processWordPhase(pi, phase.group);
+          else if (phase.type === 'bit') processBitPhase(pi, phase.group);
+          else processRMWPhase(pi, phase.group);
         }
 
-        // ===== v1.5.1: TCP 原生位写（单往返，无 RMW 竞态）=====
-        function processBitPhase(pi, bitGrp) {
-          if (node._closed) { releaseConnection(connKey); return; }
-          var sorted = bitGrp.tags.slice().sort(function (a, b) { return a.addr - b.addr; });
-          var bits = sorted.map(function (t) { return { addr: t.addr, value: t.value ? 1 : 0 }; });
-          var enc = mc.encodeBitWriteData(bits);
-
-          function attemptBitWrite(attempt) {
-            if (node._closed) { releaseConnection(connKey); return; }
-            if (mcSocket.destroyed) {
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e2, newSock) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e2) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock;
-                attemptBitWrite(attempt);
-              });
-              return;
-            }
-            if (attempt > maxRetries) {
-              hasFailed = true;
-              if (!firstError) firstError = 'MC bit-write failed for ' + bitGrp.regType + enc.startAddr;
-              sorted.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-              setTimeout(function () { processPhase(pi + 1); }, 0);
-              return;
-            }
-            var sentSN = (frameType === '4E') ? currentSN : 0;
-            if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
-
-            var buf = Buffer.alloc(0);
-            var resolved = false;
-            var _tmoHandler = null, _errHandler = null, _dataHandler = null;
-            var _reqTimer = null;
-
-            function cleanupListeners(sock) {
-              if (!sock) return;
-              sock.removeListener('data', _dataHandler);
-              sock.removeListener('timeout', _tmoHandler);
-              sock.removeListener('error', _errHandler);
-              if (_reqTimer) { clearTimeout(_reqTimer); _reqTimer = null; }
-            }
-
-            mcSocket.setTimeout(timeout);
-            try {
-              var frame = mc.buildBitWriteFrame(frameType, enc.startAddr, enc.bitCount, enc.data, stationNo, bitGrp.regType, networkNo, sentSN);
-              var wireBit = plc.ascii ? mc.toAsciiHex(frame) : frame;
-              mcSocket.write(wireBit);
-            } catch (e) {
-              node.warn('[MC-WRITE] bit frame build error: ' + e.message);
-              resolved = true; cleanupListeners(mcSocket);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e3, newSock2) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e3) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock2;
-                setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval);
-              });
-              return;
-            }
-
-            _dataHandler = function (sock) {
-              return function (chunk) {
-                try {
-                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
-                  if (plc.ascii) {
-                    if (buf.length + chunk.length > 65536) { resolved = true; cleanupListeners(sock); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
-                    buf = Buffer.concat([buf, chunk]);
-                    var _bhdr = (frameType === '4E') ? 15 : 11;
-                    var _boff = (frameType === '4E') ? 11 : 7;
-                    var bdf = mc.dehexifyFrame(buf, _bhdr, _boff);
-                    if (bdf.err) { buf = buf.slice(bdf.consumed); node.warn('[MC-WRITE] ASCII bit frame err: ' + bdf.err); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
-                    if (!bdf.result) return;
-                    resolved = true; cleanupListeners(sock);
-                    var resp = mc.parseMCWriteResponse(bdf.result, frameType, sentSN);
-                    if (resp && resp.mcError) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
-                      sorted.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                    } else if (resp && resp.ok) {
-                      var groupTs = new Date().toISOString();
-                      sorted.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
-                    } else {
-                      setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval);
-                    }
-                    setTimeout(function () { processPhase(pi + 1); }, 0);
-                    return;
-                  }
-                  if (buf.length + chunk.length > 65536) { resolved = true; cleanupListeners(sock); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
-                  buf = Buffer.concat([buf, chunk]);
-                  var hdrLen = (frameType === '4E') ? 15 : 11;
-                  if (!resolved && buf.length >= hdrLen) {
-                    var dataLen = buf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
-                    if (dataLen < 0 || dataLen > 2000) { resolved = true; cleanupListeners(sock); setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
-                    if (buf.length >= hdrLen + dataLen) {
-                      resolved = true; cleanupListeners(sock);
-                      var resp = mc.parseMCWriteResponse(buf, frameType, sentSN);
-                      if (resp && resp.mcError) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
-                        sorted.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else if (resp && resp.ok) {
-                        var groupTs = new Date().toISOString();
-                        sorted.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else {
-                        setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval);
-                      }
-                    }
-                  }
-                } catch (e) {
-                  node.warn('[MC-WRITE] bit write handler error: ' + e.message);
-                  cleanupListeners(sock); resolved = true; hasFailed = true;
-                  if (!firstError) firstError = '[DATA] ' + e.message;
-                  setTimeout(function () { processPhase(pi + 1); }, 0);
-                }
-              };
-            }(mcSocket);
-            mcSocket.on('data', _dataHandler);
-
-            _tmoHandler = function (sock) { return function () { if (resolved) return; resolved = true; cleanupListeners(sock); destroyConnection(connKey); getConnection(node, plc, function (e4, newSock3) { if (node._closed) { releaseConnection(connKey); return; } if (e4) { releaseConnection(connKey); finishWithError(); return; } mcSocket = newSock3; setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); }); }; }(mcSocket);
-            mcSocket.once('timeout', _tmoHandler);
-            _errHandler = function (sock) { return function () { if (resolved) return; resolved = true; cleanupListeners(sock); destroyConnection(connKey); getConnection(node, plc, function (e5, newSock4) { if (node._closed) { releaseConnection(connKey); return; } if (e5) { releaseConnection(connKey); finishWithError(); return; } mcSocket = newSock4; setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); }); }; }(mcSocket);
-            mcSocket.once('error', _errHandler);
-            _reqTimer = setTimeout(function () { if (resolved) return; node.warn('[MC-WRITE] bit write request-level timeout'); _tmoHandler(); }, timeout);
-          }
-          attemptBitWrite(0);
-        }
-
+        // ===== 字写入 =====
         function processWordPhase(pi, grp) {
           if (node._closed) { releaseConnection(connKey); return; }
-
           var grpSorted = grp.tags.slice().sort(function (a, b) { return a.addr - b.addr; });
           var startA = grpSorted[0].addr;
           var lastTag = grpSorted[grpSorted.length - 1];
@@ -987,16 +1035,16 @@ module.exports = function (RED) {
           var wordCount = maxAddr - startA + 1;
 
           if (wordCount > 960) {
-            // 超过 960 字再拆分（groupTags 已处理，此处兜底）
+            // 超 960 字拆分（groupTagsContiguous 已保证，此处兜底）
             var half = Math.floor(grpSorted.length / 2);
-            var g1 = grpSorted.slice(0, half);
-            var g2 = grpSorted.slice(half);
-            totalPhases.splice.apply(totalPhases, [pi, 1, { type: 'word', group: { regType: grp.regType, tags: g1 } }, { type: 'word', group: { regType: grp.regType, tags: g2 } }]);
+            totalPhases.splice.apply(totalPhases, [pi, 1,
+              { type: 'word', group: { regType: grp.regType, tags: grpSorted.slice(0, half) } },
+              { type: 'word', group: { regType: grp.regType, tags: grpSorted.slice(half) } }]);
             setTimeout(function () { processPhase(pi); }, 0);
             return;
           }
 
-          // 🔧 P0-2: groupTagsContiguous 保证严格连续→直接顺序编码
+          // groupTagsContiguous 保证严格连续 → 直接顺序编码
           var words = [];
           for (var fi = 0; fi < grpSorted.length; fi++) {
             var encoded = mc.encodeWriteWords(grpSorted[fi].value, grpSorted[fi].dataType, grpSorted[fi].byteOrder, grpSorted[fi].wordOrder);
@@ -1005,563 +1053,203 @@ module.exports = function (RED) {
 
           function attemptWordWrite(attempt) {
             if (node._closed) { releaseConnection(connKey); return; }
-            if (mcSocket.destroyed) {
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e2, newSock) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e2) {
-                  hasFailed = true;
-                  if (!firstError) firstError = '[RECONNECT] ' + e2.message;
-                  releaseConnection(connKey);
-                  finishWithError();
-                  return;
-                }
-                mcSocket = newSock;
-                attemptWordWrite(attempt);
-              });
-              return;
-            }
+            if (!ensureSocket(function () { attemptWordWrite(attempt); })) return;
             if (attempt > maxRetries) {
               hasFailed = true;
               if (!firstError) firstError = 'MC write failed for ' + grp.regType + startA;
-              grp.tags.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+              markTagsBad(grp.tags);
               setTimeout(function () { processPhase(pi + 1); }, 0);
               return;
             }
-
             var sentSN = (frameType === '4E') ? currentSN : 0;
             if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
-
-            var buf = Buffer.alloc(0);
-            var resolved = false;
-            var _tmoHandler = null, _errHandler = null, _dataHandler = null;
-            var _reqTimer = null;
-
-            function cleanupListeners(sock) {
-              if (!sock) return;
-              sock.removeListener('data', _dataHandler);
-              sock.removeListener('timeout', _tmoHandler);
-              sock.removeListener('error', _errHandler);
-              if (_reqTimer) { clearTimeout(_reqTimer); _reqTimer = null; }
-            }
-
-            mcSocket.setTimeout(timeout);
-
+            var wireFrame;
             try {
-              var frame = mc.buildWriteFrame(frameType, startA, words, stationNo, grp.regType, networkNo, sentSN);
-              var wireFrameW = plc.ascii ? mc.toAsciiHex(frame) : frame;
-              mcSocket.write(wireFrameW);
+              wireFrame = buildWriteWire(startA, words, grp.regType, sentSN);
             } catch (e) {
-              node.warn('[MC-WRITE] write error: ' + e.message);
-              resolved = true;
-              cleanupListeners(mcSocket);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e3, newSock2) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e3) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock2;
-                setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-              });
+              node.warn('[MC-WRITE] frame build error: ' + e.message);
+              hasFailed = true;
+              if (!firstError) firstError = '[FRAME] ' + e.message;
+              markTagsBad(grp.tags);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
               return;
             }
-
-            _dataHandler = function (sock) {
-              return function (chunk) {
-                try {
-                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
-                  if (plc.ascii) {
-                    if (buf.length + chunk.length > 65536) {
-                      resolved = true; cleanupListeners(sock);
-                      node.warn('[MC-WRITE] ASCII buffer overflow');
-                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                      return;
-                    }
-                    buf = Buffer.concat([buf, chunk]);
-                    var _hdrLen = (frameType === '4E') ? 15 : 11;
-                    var _lenOff = (frameType === '4E') ? 11 : 7;
-                    var df = mc.dehexifyFrame(buf, _hdrLen, _lenOff);
-                    if (df.err) {
-                      buf = buf.slice(df.consumed);
-                      node.warn('[MC-WRITE] ASCII frame error: ' + df.err);
-                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                      return;
-                    }
-                    if (!df.result) return;
-                    resolved = true; cleanupListeners(sock);
-                    var resp = mc.parseMCWriteResponse(df.result, frameType, sentSN);
-                    if (resp && resp.mcError) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
-                      grp.tags.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                    } else if (resp && resp.ok) {
-                      var groupTs = new Date().toISOString();
-                      grp.tags.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
-                    } else {
-                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                    }
-                    setTimeout(function () { processPhase(pi + 1); }, 0);
-                    return;
-                  }
-                  if (buf.length + chunk.length > 65536) {
-                    resolved = true;
-                    cleanupListeners(sock);
-                    node.warn('[MC-WRITE] Buffer overflow ' + (buf.length + chunk.length) + ' bytes, discarding');
-                    setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                    return;
-                  }
-                  buf = Buffer.concat([buf, chunk]);
-                  var hdrLen = (frameType === '4E') ? 15 : 11;
-                  if (!resolved && buf.length >= hdrLen) {
-                    var dataLen = buf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
-                    if (dataLen < 0 || dataLen > 2000) {
-                      resolved = true;
-                      cleanupListeners(sock);
-                      setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                      return;
-                    }
-                    if (buf.length >= hdrLen + dataLen) {
-                      resolved = true;
-                      cleanupListeners(sock);
-                      var resp = mc.parseMCWriteResponse(buf, frameType, sentSN);
-                      if (resp && resp.mcError) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
-                        grp.tags.forEach(function (t) { allResults[t.id] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else if (resp && resp.ok) {
-                        var groupTs = new Date().toISOString();
-                        grp.tags.forEach(function (t) { allResults[t.id] = { value: t.value, quality: 0, ts: groupTs }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else {
-                        setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                      }
-                    }
-                  }
-                } catch (e) {
-                  node.warn('[MC-WRITE] data handler error: ' + e.message);
-                  cleanupListeners(sock);
-                  resolved = true;
-                  hasFailed = true;
-                  if (!firstError) firstError = '[DATA] ' + e.message;
-                  setTimeout(function () { processPhase(pi + 1); }, 0);
-                }
-              };
-            }(mcSocket);
-
-            mcSocket.on('data', _dataHandler);
-
-            _tmoHandler = function (sock) {
-              return function () {
-                if (resolved) return;
-                resolved = true;
-                cleanupListeners(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e4, newSock3) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e4) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock3;
-                  setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
-            mcSocket.once('timeout', _tmoHandler);
-
-            _errHandler = function (sock) {
-              return function () {
-                if (resolved) return;
-                resolved = true;
-                cleanupListeners(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e5, newSock4) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e5) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock4;
-                  setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
-            mcSocket.once('error', _errHandler);
-
-            _reqTimer = setTimeout(function () {
-              if (resolved) return;
-              node.warn('[MC-WRITE] request-level timeout (slow-drip response or stuck peer)');
-              _tmoHandler();
-            }, timeout);
+            wireRequest(wireFrame, sentSN, function (werr, binFrame) {
+              if (node._closed) { releaseConnection(connKey); return; }
+              if (werr) { setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval); return; }
+              var resp;
+              try { resp = mc.parseMCWriteResponse(binFrame, respFrameType, sentSN); }
+              catch (e) { setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval); return; }
+              if (resp && resp.mcError) {
+                hasFailed = true;
+                if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
+                markTagsBad(grp.tags);
+              } else if (resp && resp.ok) {
+                markTagsGood(grp.tags);
+              } else {
+                setTimeout(function () { attemptWordWrite(attempt + 1); }, retryInterval);
+                return;
+              }
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+            });
           }
           attemptWordWrite(0);
         }
 
-        function processRMWPhase(pi, rmwGrp) {
+        // ===== 位设备原生位写（仅 binary / ascii_slmp；ascii_q 已在分流阶段改走 RMW）=====
+        function processBitPhase(pi, bitGrp) {
           if (node._closed) { releaseConnection(connKey); return; }
-          if (mcSocket.destroyed) {
-            destroyConnection(connKey);
-            getConnection(node, plc, function (e2, newSock) {
-              if (node._closed) { releaseConnection(connKey); return; }
-              if (e2) { releaseConnection(connKey); finishWithError(); return; }
-              mcSocket = newSock;
-              processRMWPhase(pi, rmwGrp);
-            });
-            return;
-          }
+          var sorted = bitGrp.tags.slice().sort(function (a, b) { return a.addr - b.addr; });
+          var bits = sorted.map(function (t) { return { addr: t.addr, value: t.value ? 1 : 0 }; });
+          var enc = mc.encodeBitWriteData(bits);
 
-          // Step 1: 读当前字
-          var sentSN = (frameType === '4E') ? currentSN : 0;
-          if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
-          var readFrame;
-          try {
-            readFrame = (frameType === '4E')
-              ? mc.build4EFrame(rmwGrp.wordAddr, 1, stationNo, rmwGrp.regType, networkNo, sentSN)
-              : mc.build3EFrame(rmwGrp.wordAddr, 1, stationNo, rmwGrp.regType, networkNo);
-          } catch (e) {
-            node.warn('[MC-WRITE] RMW read frame error: ' + e.message);
-            hasFailed = true;
-            if (!firstError) firstError = '[RMW-READ] ' + e.message;
-            rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-            setTimeout(function () { processPhase(pi + 1); }, 0);
-            return;
-          }
-
-          function rmwReadAttempt(attempt) {
+          function attemptBitWrite(attempt) {
             if (node._closed) { releaseConnection(connKey); return; }
-            if (mcSocket.destroyed) {
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e2, newSock) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e2) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock;
-                rmwReadAttempt(attempt);
-              });
-              return;
-            }
+            if (!ensureSocket(function () { attemptBitWrite(attempt); })) return;
             if (attempt > maxRetries) {
               hasFailed = true;
-              if (!firstError) firstError = '[RMW-READ] failed for ' + rmwGrp.regType + rmwGrp.wordAddr;
-              rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+              if (!firstError) firstError = 'MC bit-write failed for ' + bitGrp.regType + enc.startAddr;
+              markTagsBad(sorted);
               setTimeout(function () { processPhase(pi + 1); }, 0);
               return;
             }
-
-            var rdBuf = Buffer.alloc(0);
-            var rdResolved = false;
-            var rdTmo = null, rdErr = null, rdData = null;
-            var rdReqTimer = null;
-
-            function rdCleanup(sock) {
-              if (!sock) return;
-              sock.removeListener('data', rdData);
-              sock.removeListener('timeout', rdTmo);
-              sock.removeListener('error', rdErr);
-              if (rdReqTimer) { clearTimeout(rdReqTimer); rdReqTimer = null; }
-            }
-
-            mcSocket.setTimeout(timeout);
-
-            try {
-              var wireRMW = plc.ascii ? mc.toAsciiHex(readFrame) : readFrame;
-              mcSocket.write(wireRMW);
-            } catch (e) {
-              node.warn('[MC-WRITE] RMW read write error: ' + e.message);
-              rdResolved = true;
-              rdCleanup(mcSocket);
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e3, newSock2) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e3) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock2;
-                setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-              });
-              return;
-            }
-
-            rdData = function (sock) {
-              return function (chunk) {
-                try {
-                  if (rdBuf.length + chunk.length > 65536) {
-                    rdResolved = true; rdCleanup(sock);
-                    setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                    return;
-                  }
-                  rdBuf = Buffer.concat([rdBuf, chunk]);
-                  var rHdrLen = (frameType === '4E') ? 15 : 11;
-                  var rLenOff = (frameType === '4E') ? 11 : 7;
-                  // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
-                  if (plc.ascii) {
-                    var rmwDf = mc.dehexifyFrame(rdBuf, rHdrLen, rLenOff);
-                    if (rmwDf.err) { rdBuf = rdBuf.slice(rmwDf.consumed); node.warn('[MC-WRITE] RMW read ASCII frame err: ' + rmwDf.err); setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval); return; }
-                    if (!rmwDf.result) return;
-                    rdBuf = Buffer.concat([rmwDf.result, rdBuf.slice(rmwDf.consumed)]);
-                    rdResolved = true; rdCleanup(sock);
-                  } else {
-                    // Binary: frame boundary detection
-                    if (rdBuf.length < rHdrLen) return;           // need more data
-                    if (rdResolved) return;
-                    var dataLen = rdBuf.readUInt16LE(rLenOff) - 2;
-                    if (dataLen < 0 || dataLen > 2000) {
-                      rdResolved = true; rdCleanup(sock);
-                      setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                      return;
-                    }
-                    if (rdBuf.length < rHdrLen + dataLen) return; // incomplete frame
-                    rdResolved = true; rdCleanup(sock);
-                  }
-                  if (rdBuf.length >= rHdrLen) {
-                    var raw = mc.parseMCResponse(rdBuf, rmwGrp.wordAddr, rmwGrp.regType, frameType, sentSN);
-                    if (!raw || raw.err || raw.mcError) {
-                      setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                      return;
-                    }
-                    // 直接读 buf 中的 raw word（处理完 hex 解码的 ASCII 路径也一样）
-                    var ds2 = (frameType === '4E') ? 15 : 11;
-                    if (rdBuf.length < ds2 + 2) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[RMW-READ] buffer too short for ' + rmwGrp.regType + rmwGrp.wordAddr;
-                      rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                      setTimeout(function () { processPhase(pi + 1); }, 0);
-                      return;
-                    }
-                    var wordVal = rdBuf.readUInt16LE(ds2);
-                    if (wordVal === undefined || wordVal === null) {
-                      hasFailed = true;
-                      if (!firstError) firstError = '[RMW-READ] no data for ' + rmwGrp.regType + rmwGrp.wordAddr;
-                      rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                      setTimeout(function () { processPhase(pi + 1); }, 0);
-                      return;
-                    }
-                    // Step 2: 修改位
-                    var modified = wordVal & 0xFFFF;
-                      rmwGrp.bits.forEach(function (b) {
-                        if (b.value) modified |= (1 << b.bitOffset);
-                        else modified &= ~(1 << b.bitOffset);
-                      });
-                      // Step 3: 写回
-                      rmwWriteBack(modified);
-                    }
-                } catch (e) {
-                  node.warn('[MC-WRITE] RMW read handler error: ' + e.message);
-                  rdCleanup(sock); rdResolved = true;
-                  hasFailed = true;
-                  if (!firstError) firstError = '[RMW-READ] ' + e.message;
-                  setTimeout(function () { processPhase(pi + 1); }, 0);
-                }
-              };
-            }(mcSocket);
-            mcSocket.on('data', rdData);
-
-            rdTmo = function (sock) {
-              return function () {
-                if (rdResolved) return;
-                rdResolved = true; rdCleanup(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e4, newSock3) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e4) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock3;
-                  setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
-            mcSocket.once('timeout', rdTmo);
-
-            rdErr = function (sock) {
-              return function () {
-                if (rdResolved) return;
-                rdResolved = true; rdCleanup(sock);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e5, newSock4) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e5) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock4;
-                  setTimeout(function () { rmwReadAttempt(attempt + 1); }, retryInterval);
-                });
-              };
-            }(mcSocket);
-            mcSocket.once('error', rdErr);
-
-            rdReqTimer = setTimeout(function () {
-              if (rdResolved) return;
-              node.warn('[MC-WRITE] RMW read request-level timeout');
-              rdTmo();
-            }, timeout);
-          }
-
-          function rmwWriteBack(modified) {
-            if (node._closed) { releaseConnection(connKey); return; }
-            if (mcSocket.destroyed) {
-              destroyConnection(connKey);
-              getConnection(node, plc, function (e2, newSock) {
-                if (node._closed) { releaseConnection(connKey); return; }
-                if (e2) { releaseConnection(connKey); finishWithError(); return; }
-                mcSocket = newSock;
-                rmwWriteBack(modified);
-              });
-              return;
-            }
-
-            var wsSN = (frameType === '4E') ? currentSN : 0;
+            var sentSN = (frameType === '4E') ? currentSN : 0;
             if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
-            var writeFrame = mc.buildWriteFrame(frameType, rmwGrp.wordAddr, [modified], stationNo, rmwGrp.regType, networkNo, wsSN);
-
-            function rmwWriteAttempt(writeAttempt) {
+            var wireFrame;
+            try {
+              var frame = mc.buildBitWriteFrame(frameType, enc.startAddr, enc.bitCount, enc.data, stationNo, bitGrp.regType, networkNo, sentSN);
+              wireFrame = (plc.commCode === 'ascii_slmp') ? mc.toAsciiHex(frame) : frame;
+            } catch (e) {
+              node.warn('[MC-WRITE] bit frame build error: ' + e.message);
+              hasFailed = true;
+              if (!firstError) firstError = '[FRAME] ' + e.message;
+              markTagsBad(sorted);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+              return;
+            }
+            wireRequest(wireFrame, sentSN, function (werr, binFrame) {
               if (node._closed) { releaseConnection(connKey); return; }
-              if (mcSocket.destroyed) {
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e2, newSock) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e2) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock;
-                  rmwWriteAttempt(writeAttempt);
-                });
+              if (werr) { setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
+              var resp;
+              try { resp = mc.parseMCWriteResponse(binFrame, respFrameType, sentSN); }
+              catch (e) { setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval); return; }
+              if (resp && resp.mcError) {
+                hasFailed = true;
+                if (!firstError) firstError = '[PLC 0x' + resp.mcError.toString(16).toUpperCase() + '] ' + resp.mcErrorText;
+                markTagsBad(sorted);
+              } else if (resp && resp.ok) {
+                markTagsGood(sorted);
+              } else {
+                setTimeout(function () { attemptBitWrite(attempt + 1); }, retryInterval);
                 return;
               }
-              if (writeAttempt > maxRetries) {
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+            });
+          }
+          attemptBitWrite(0);
+        }
+
+        // ===== 字内 BOOL RMW（ascii_q 的位设备写也走这里：读字→改位→写回字）=====
+        function processRMWPhase(pi, rmwGrp) {
+          if (node._closed) { releaseConnection(connKey); return; }
+
+          function rmwRead(attempt) {
+            if (node._closed) { releaseConnection(connKey); return; }
+            if (!ensureSocket(function () { rmwRead(attempt); })) return;
+            if (attempt > maxRetries) {
+              hasFailed = true;
+              if (!firstError) firstError = '[RMW-READ] failed for ' + rmwGrp.regType + rmwGrp.wordAddr;
+              markBitsBad(rmwGrp.bits);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+              return;
+            }
+            var sentSN = (frameType === '4E') ? currentSN : 0;
+            if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
+            var readWire;
+            try {
+              readWire = buildReadWire(rmwGrp.wordAddr, 1, rmwGrp.regType, sentSN);
+            } catch (e) {
+              node.warn('[MC-WRITE] RMW read frame error: ' + e.message);
+              hasFailed = true;
+              if (!firstError) firstError = '[RMW-READ] ' + e.message;
+              markBitsBad(rmwGrp.bits);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+              return;
+            }
+            wireRequest(readWire, sentSN, function (rerr, binFrame) {
+              if (node._closed) { releaseConnection(connKey); return; }
+              if (rerr) { setTimeout(function () { rmwRead(attempt + 1); }, retryInterval); return; }
+              var endCodeOff = (respFrameType === '4E') ? 13 : 9;
+              if (binFrame.length < respDataStart + 2) {
                 hasFailed = true;
-                if (!firstError) firstError = '[RMW-WRITE] failed for ' + rmwGrp.regType + rmwGrp.wordAddr;
-                rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
+                if (!firstError) firstError = '[RMW-READ] buffer too short for ' + rmwGrp.regType + rmwGrp.wordAddr;
+                markBitsBad(rmwGrp.bits);
                 setTimeout(function () { processPhase(pi + 1); }, 0);
                 return;
               }
-
-              var wrBuf = Buffer.alloc(0);
-              var wrResolved = false;
-              var wrTmo = null, wrErr = null, wrData = null;
-              var wrReqTimer = null;
-
-              function wrCleanup(sock) {
-                if (!sock) return;
-                sock.removeListener('data', wrData);
-                sock.removeListener('timeout', wrTmo);
-                sock.removeListener('error', wrErr);
-                if (wrReqTimer) { clearTimeout(wrReqTimer); wrReqTimer = null; }
-              }
-
-              mcSocket.setTimeout(timeout);
-
-              try {
-                var wireRMW2 = plc.ascii ? mc.toAsciiHex(writeFrame) : writeFrame;
-                mcSocket.write(wireRMW2);
-              } catch (e) {
-                node.warn('[MC-WRITE] RMW write error: ' + e.message);
-                wrResolved = true; wrCleanup(mcSocket);
-                destroyConnection(connKey);
-                getConnection(node, plc, function (e3, newSock2) {
-                  if (node._closed) { releaseConnection(connKey); return; }
-                  if (e3) { releaseConnection(connKey); finishWithError(); return; }
-                  mcSocket = newSock2;
-                  setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                });
+              var endCode = binFrame.readUInt16LE(endCodeOff);
+              if (endCode !== 0) {
+                hasFailed = true;
+                if (!firstError) firstError = '[PLC 0x' + endCode.toString(16).toUpperCase() + '] ' + mc.mcErrorText(endCode);
+                markBitsBad(rmwGrp.bits);
+                setTimeout(function () { processPhase(pi + 1); }, 0);
                 return;
               }
-
-              wrData = function (sock) {
-                return function (chunk) {
-                  try {
-                    // 🔧 v1.6.0: SLMP ASCII Code — hex 编解码
-                    if (plc.ascii) {
-                      if (wrBuf.length + chunk.length > 65536) { wrResolved = true; wrCleanup(sock); setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval); return; }
-                      wrBuf = Buffer.concat([wrBuf, chunk]);
-                      var _whdr = (frameType === '4E') ? 15 : 11;
-                      var _woff = (frameType === '4E') ? 11 : 7;
-                      var wdf = mc.dehexifyFrame(wrBuf, _whdr, _woff);
-                      if (wdf.err) { wrBuf = wrBuf.slice(wdf.consumed); node.warn('[MC-WRITE] RMW write ASCII frame err: ' + wdf.err); setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval); return; }
-                      if (!wdf.result) return;
-                      wrResolved = true; wrCleanup(sock);
-                      var wresp = mc.parseMCWriteResponse(wdf.result, frameType, wsSN);
-                      if (wresp && wresp.ok) {
-                        var groupTs = new Date().toISOString();
-                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: b.value, quality: 0, ts: groupTs }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else if (wresp && wresp.mcError) {
-                        hasFailed = true;
-                        if (!firstError) firstError = '[PLC 0x' + wresp.mcError.toString(16).toUpperCase() + '] ' + wresp.mcErrorText;
-                        rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                        setTimeout(function () { processPhase(pi + 1); }, 0);
-                      } else {
-                        setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                      }
-                      return;
-                    }
-                    if (wrBuf.length + chunk.length > 65536) {
-                      wrResolved = true; wrCleanup(sock);
-                      setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                      return;
-                    }
-                    wrBuf = Buffer.concat([wrBuf, chunk]);
-                    var hdrLen = (frameType === '4E') ? 15 : 11;
-                    if (!wrResolved && wrBuf.length >= hdrLen) {
-                      var dataLen = wrBuf.readUInt16LE((frameType === '4E') ? 11 : 7) - 2;
-                      if (dataLen < 0 || dataLen > 2000) {
-                        wrResolved = true; wrCleanup(sock);
-                        setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                        return;
-                      }
-                      if (wrBuf.length >= hdrLen + dataLen) {
-                        wrResolved = true; wrCleanup(sock);
-                        var wresp = mc.parseMCWriteResponse(wrBuf, frameType, wsSN);
-                        if (wresp && wresp.ok) {
-                          var groupTs = new Date().toISOString();
-                          rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: b.value, quality: 0, ts: groupTs }; });
-                          setTimeout(function () { processPhase(pi + 1); }, 0);
-                        } else if (wresp && wresp.mcError) {
-                          hasFailed = true;
-                          if (!firstError) firstError = '[PLC 0x' + wresp.mcError.toString(16).toUpperCase() + '] ' + wresp.mcErrorText;
-                          rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: null, quality: 2, ts: new Date().toISOString() }; });
-                          setTimeout(function () { processPhase(pi + 1); }, 0);
-                        } else {
-                          setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                        }
-                      }
-                    }
-                  } catch (e) {
-                    node.warn('[MC-WRITE] RMW write handler error: ' + e.message);
-                    wrCleanup(sock); wrResolved = true;
-                    hasFailed = true;
-                    if (!firstError) firstError = '[RMW-WRITE] ' + e.message;
-                    setTimeout(function () { processPhase(pi + 1); }, 0);
-                  }
-                };
-              }(mcSocket);
-              mcSocket.on('data', wrData);
-
-              wrTmo = function (sock) {
-                return function () {
-                  if (wrResolved) return;
-                  wrResolved = true; wrCleanup(sock);
-                  destroyConnection(connKey);
-                  getConnection(node, plc, function (e4, newSock3) {
-                    if (node._closed) { releaseConnection(connKey); return; }
-                    if (e4) { releaseConnection(connKey); finishWithError(); return; }
-                    mcSocket = newSock3;
-                    setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                  });
-                };
-              }(mcSocket);
-              mcSocket.once('timeout', wrTmo);
-
-              wrErr = function (sock) {
-                return function () {
-                  if (wrResolved) return;
-                  wrResolved = true; wrCleanup(sock);
-                  destroyConnection(connKey);
-                  getConnection(node, plc, function (e5, newSock4) {
-                    if (node._closed) { releaseConnection(connKey); return; }
-                    if (e5) { releaseConnection(connKey); finishWithError(); return; }
-                    mcSocket = newSock4;
-                    setTimeout(function () { rmwWriteAttempt(writeAttempt + 1); }, retryInterval);
-                  });
-                };
-              }(mcSocket);
-              mcSocket.once('error', wrErr);
-
-              wrReqTimer = setTimeout(function () {
-                if (wrResolved) return;
-                node.warn('[MC-WRITE] RMW write request-level timeout');
-                wrTmo();
-              }, timeout);
-            }
-            rmwWriteAttempt(0);
+              var wordVal = binFrame.readUInt16LE(respDataStart);
+              var modified = wordVal & 0xFFFF;
+              rmwGrp.bits.forEach(function (b) {
+                if (b.value) modified |= (1 << b.bitOffset);
+                else modified &= ~(1 << b.bitOffset);
+              });
+              rmwWrite(modified, 0);
+            });
           }
 
-          rmwReadAttempt(0);
+          function rmwWrite(modified, attempt) {
+            if (node._closed) { releaseConnection(connKey); return; }
+            if (!ensureSocket(function () { rmwWrite(modified, attempt); })) return;
+            if (attempt > maxRetries) {
+              hasFailed = true;
+              if (!firstError) firstError = '[RMW-WRITE] failed for ' + rmwGrp.regType + rmwGrp.wordAddr;
+              markBitsBad(rmwGrp.bits);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+              return;
+            }
+            var wsSN = (frameType === '4E') ? currentSN : 0;
+            if (frameType === '4E') currentSN = (currentSN + 1) & 0xFFFF;
+            var writeWire;
+            try {
+              writeWire = buildWriteWire(rmwGrp.wordAddr, [modified], rmwGrp.regType, wsSN);
+            } catch (e) {
+              node.warn('[MC-WRITE] RMW write frame error: ' + e.message);
+              hasFailed = true;
+              if (!firstError) firstError = '[RMW-WRITE] ' + e.message;
+              markBitsBad(rmwGrp.bits);
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+              return;
+            }
+            wireRequest(writeWire, wsSN, function (werr, binFrame) {
+              if (node._closed) { releaseConnection(connKey); return; }
+              if (werr) { setTimeout(function () { rmwWrite(modified, attempt + 1); }, retryInterval); return; }
+              var wresp;
+              try { wresp = mc.parseMCWriteResponse(binFrame, respFrameType, wsSN); }
+              catch (e) { setTimeout(function () { rmwWrite(modified, attempt + 1); }, retryInterval); return; }
+              if (wresp && wresp.mcError) {
+                hasFailed = true;
+                if (!firstError) firstError = '[PLC 0x' + wresp.mcError.toString(16).toUpperCase() + '] ' + wresp.mcErrorText;
+                markBitsBad(rmwGrp.bits);
+              } else if (wresp && wresp.ok) {
+                var ts = new Date().toISOString();
+                rmwGrp.bits.forEach(function (b) { allResults[b.tagId] = { value: b.value, quality: 0, ts: ts }; });
+              } else {
+                setTimeout(function () { rmwWrite(modified, attempt + 1); }, retryInterval);
+                return;
+              }
+              setTimeout(function () { processPhase(pi + 1); }, 0);
+            });
+          }
+
+          rmwRead(0);
         }
 
         function finishWithError() {
